@@ -62,6 +62,8 @@ export default function AIPromptsPage() {
   const [showDialog, setShowDialog] = useState(false);
   const [editingPrompt, setEditingPrompt] = useState<AIPrompt | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
   const [form, setForm] = useState<Partial<AIPrompt>>({
     naam: '',
     type: 'agent',
@@ -113,9 +115,20 @@ export default function AIPromptsPage() {
 
   const handleSave = async () => {
     if (!form.naam || !form.prompt_tekst) return;
+    setSaveError(null);
+    setSaving(true);
+
     if (editingPrompt) {
       const newVersie = editingPrompt.versie + 1;
-      const { data } = await supabase
+      const updatedPrompt: AIPrompt = { ...editingPrompt, ...form, versie: newVersie } as AIPrompt;
+
+      // Optimistic update
+      setPrompts((prev) =>
+        prev.map((p) => (p.id === editingPrompt.id ? updatedPrompt : p))
+      );
+      setShowDialog(false);
+
+      const { error } = await supabase
         .from('ai_prompts')
         .update({
           naam: form.naam,
@@ -125,20 +138,18 @@ export default function AIPromptsPage() {
           beschrijving: form.beschrijving ?? null,
           versie: newVersie,
         })
-        .eq('id', editingPrompt.id)
-        .select()
-        .single();
-      if (data) {
+        .eq('id', editingPrompt.id);
+
+      if (error) {
+        // Rollback on failure
         setPrompts((prev) =>
-          prev.map((p) =>
-            p.id === editingPrompt.id
-              ? { ...p, ...form, versie: newVersie } as AIPrompt
-              : p
-          )
+          prev.map((p) => (p.id === editingPrompt.id ? editingPrompt : p))
         );
+        setSaveError(`Opslaan mislukt: ${error.message}`);
+        setShowDialog(true);
       }
     } else {
-      const { data } = await supabase
+      const { data, error } = await supabase
         .from('ai_prompts')
         .insert({
           naam: form.naam,
@@ -151,7 +162,10 @@ export default function AIPromptsPage() {
         })
         .select()
         .single();
-      if (data) {
+
+      if (error || !data) {
+        setSaveError(`Toevoegen mislukt: ${error?.message ?? 'Onbekende fout'}`);
+      } else {
         setPrompts((prev) => [
           ...prev,
           {
@@ -165,9 +179,11 @@ export default function AIPromptsPage() {
             beschrijving: data.beschrijving ?? undefined,
           },
         ]);
+        setShowDialog(false);
       }
     }
-    setShowDialog(false);
+
+    setSaving(false);
   };
 
   const handleDelete = async (id: string) => {
@@ -349,7 +365,7 @@ export default function AIPromptsPage() {
       </Tabs>
 
       {/* Dialog */}
-      <Dialog open={showDialog} onOpenChange={setShowDialog}>
+      <Dialog open={showDialog} onOpenChange={(open) => { setShowDialog(open); if (!open) setSaveError(null); }}>
         <DialogContent className="max-w-lg">
           <DialogHeader>
             <DialogTitle>
@@ -361,6 +377,11 @@ export default function AIPromptsPage() {
                 : 'Voeg een nieuwe AI prompt toe aan de pipeline'}
             </DialogDescription>
           </DialogHeader>
+          {saveError && (
+            <div className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">
+              {saveError}
+            </div>
+          )}
           <div className="space-y-4 py-2">
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-1.5">
@@ -421,9 +442,9 @@ export default function AIPromptsPage() {
               <X className="mr-1.5 size-3.5" />
               Annuleren
             </Button>
-            <Button onClick={handleSave} disabled={!form.naam || !form.prompt_tekst}>
+            <Button onClick={handleSave} disabled={!form.naam || !form.prompt_tekst || saving}>
               <Check className="mr-1.5 size-3.5" />
-              {editingPrompt ? 'Opslaan' : 'Toevoegen'}
+              {saving ? 'Bezig…' : editingPrompt ? 'Opslaan' : 'Toevoegen'}
             </Button>
           </DialogFooter>
         </DialogContent>
