@@ -1,81 +1,48 @@
 import { Plus, Download } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { TenderTable } from '@/components/aanbestedingen/tender-table';
+import { createClient } from '@/lib/supabase/server';
 import { Aanbesteding } from '@/types';
 
-// Mock data — replace with Supabase query
-const mockData: Aanbesteding[] = [
-  {
-    id: '1',
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-    titel: 'Renovatie gemeentehuis Utrecht',
-    beschrijving: 'Complete renovatie van het historische gemeentehuis inclusief verduurzaming.',
-    opdrachtgever: 'Gemeente Utrecht',
-    publicatiedatum: new Date(Date.now() - 10 * 86400000).toISOString(),
-    sluitingsdatum: new Date(Date.now() + 7 * 86400000).toISOString(),
-    bron_url: 'https://www.tenderned.nl',
-    bron_website: 'TenderNed',
-    status: 'gevonden',
-    totaal_score: 78,
-    ai_samenvatting: 'Renovatieopdracht voor het historisch gemeentehuis van Utrecht met focus op duurzaamheid.',
-    is_upload: false,
-  },
-  {
-    id: '2',
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-    titel: 'ICT-infrastructuur provincie Zuid-Holland',
-    beschrijving: 'Levering en beheer van ICT-infrastructuur voor alle provinciale gebouwen.',
-    opdrachtgever: 'Provincie Zuid-Holland',
-    publicatiedatum: new Date(Date.now() - 5 * 86400000).toISOString(),
-    sluitingsdatum: new Date(Date.now() + 14 * 86400000).toISOString(),
-    bron_website: 'TenderNed',
-    status: 'gekwalificeerd',
-    totaal_score: 85,
-    is_upload: false,
-  },
-  {
-    id: '3',
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-    titel: 'Groenonderhoud Almere 2025',
-    beschrijving: 'Meerjarig contract voor groenonderhoud in alle wijken van Almere.',
-    opdrachtgever: 'Gemeente Almere',
-    publicatiedatum: new Date(Date.now() - 15 * 86400000).toISOString(),
-    sluitingsdatum: new Date(Date.now() + 3 * 86400000).toISOString(),
-    status: 'in_aanbieding',
-    totaal_score: 92,
-    is_upload: false,
-  },
-  {
-    id: '4',
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-    titel: 'Beveiligingsdiensten Rijkswaterstaat',
-    beschrijving: 'Bewaking en beveiliging van Rijkswaterstaat locaties in Noord-Holland.',
-    opdrachtgever: 'Rijkswaterstaat',
-    publicatiedatum: new Date(Date.now() - 30 * 86400000).toISOString(),
-    sluitingsdatum: new Date(Date.now() - 5 * 86400000).toISOString(),
-    status: 'afgewezen',
-    totaal_score: 45,
-    is_upload: false,
-  },
-  {
-    id: '5',
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-    titel: 'Schoonmaakdiensten Belastingdienst',
-    opdrachtgever: 'Belastingdienst',
-    sluitingsdatum: new Date(Date.now() + 21 * 86400000).toISOString(),
-    status: 'gevonden',
-    totaal_score: 61,
-    is_upload: true,
-    bestandsnaam: 'aanbesteding_belastingdienst.pdf',
-  },
-];
+export const dynamic = 'force-dynamic';
 
-export default function AanbestedingenPage() {
+export default async function AanbestedingenPage() {
+  const supabase = await createClient();
+
+  const { data, error } = await supabase
+    .from('aanbestedingen')
+    .select('*')
+    .order('updated_at', { ascending: false });
+
+  const aanbestedingen: Aanbesteding[] = (data ?? []).map((row) => ({
+    id: row.id,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    titel: row.titel,
+    beschrijving: row.beschrijving ?? undefined,
+    opdrachtgever: row.opdrachtgever ?? undefined,
+    publicatiedatum: row.publicatiedatum ?? undefined,
+    sluitingsdatum: row.sluitingsdatum ?? undefined,
+    bron_url: row.bron_url ?? undefined,
+    bron_website: row.bron_website ?? undefined,
+    status: row.status as Aanbesteding['status'],
+    pre_kwalificatie_nummer: row.pre_kwalificatie_nummer ?? undefined,
+    definitief_nummer: row.definitief_nummer ?? undefined,
+    ruwe_tekst: row.ruwe_tekst ?? undefined,
+    document_urls: row.document_urls ?? undefined,
+    criteria_scores: (row.criteria_scores as Record<string, number>) ?? undefined,
+    totaal_score: row.totaal_score ?? undefined,
+    ai_samenvatting: row.ai_samenvatting ?? undefined,
+    highlight_data: (row.highlight_data as Record<string, string[]>) ?? undefined,
+    is_upload: row.is_upload,
+    bestandsnaam: row.bestandsnaam ?? undefined,
+    notities: row.notities ?? undefined,
+  }));
+
+  if (error) {
+    console.error('Supabase error:', error);
+  }
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -97,7 +64,7 @@ export default function AanbestedingenPage() {
         </div>
       </div>
 
-      <TenderTable data={mockData} />
+      <TenderTable data={aanbestedingen} />
     </div>
   );
 }

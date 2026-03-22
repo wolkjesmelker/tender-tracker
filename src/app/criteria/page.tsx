@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Plus, GripVertical, Pencil, Trash2, Check, X } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -18,18 +18,14 @@ import {
 } from '@/components/ui/dialog';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
+import { Skeleton } from '@/components/ui/skeleton';
 import { Criterium } from '@/types';
-
-const initialCriteria: Criterium[] = [
-  { id: '1', naam: 'Ervaring', beschrijving: 'Aantoonbare ervaring in soortgelijke projecten', gewicht: 25, is_actief: true, volgorde: 1 },
-  { id: '2', naam: 'Prijs', beschrijving: 'Concurrentie op prijs en kosten-batenverhouding', gewicht: 30, is_actief: true, volgorde: 2 },
-  { id: '3', naam: 'Planning', beschrijving: 'Realistische en gedetailleerde projectplanning', gewicht: 20, is_actief: true, volgorde: 3 },
-  { id: '4', naam: 'Duurzaamheid', beschrijving: 'Milieuvriendelijkheid en duurzame aanpak', gewicht: 15, is_actief: true, volgorde: 4 },
-  { id: '5', naam: 'Team kwaliteit', beschrijving: 'Kwalificaties en samenstelling van het team', gewicht: 10, is_actief: true, volgorde: 5 },
-];
+import { createClient } from '@/lib/supabase/client';
 
 export default function CriteriaPage() {
-  const [criteria, setCriteria] = useState<Criterium[]>(initialCriteria);
+  const [criteria, setCriteria] = useState<Criterium[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editForm, setEditForm] = useState<Partial<Criterium>>({});
   const [showAddDialog, setShowAddDialog] = useState(false);
@@ -40,14 +36,41 @@ export default function CriteriaPage() {
     is_actief: true,
   });
 
+  const supabase = createClient();
+
+  useEffect(() => {
+    async function load() {
+      const { data } = await supabase
+        .from('criteria')
+        .select('*')
+        .order('volgorde');
+      if (data) {
+        setCriteria(
+          data.map((c) => ({
+            id: c.id,
+            naam: c.naam,
+            beschrijving: c.beschrijving ?? undefined,
+            gewicht: Number(c.gewicht),
+            is_actief: c.is_actief,
+            volgorde: c.volgorde,
+          }))
+        );
+      }
+      setLoading(false);
+    }
+    load();
+  }, []);
+
   const totalWeight = criteria
     .filter((c) => c.is_actief)
     .reduce((sum, c) => sum + c.gewicht, 0);
 
-  const toggleActive = (id: string) => {
-    setCriteria((prev) =>
-      prev.map((c) => (c.id === id ? { ...c, is_actief: !c.is_actief } : c))
-    );
+  const toggleActive = async (id: string) => {
+    const c = criteria.find((x) => x.id === id);
+    if (!c) return;
+    const newVal = !c.is_actief;
+    setCriteria((prev) => prev.map((x) => (x.id === id ? { ...x, is_actief: newVal } : x)));
+    await supabase.from('criteria').update({ is_actief: newVal }).eq('id', id);
   };
 
   const startEdit = (c: Criterium) => {
@@ -55,38 +78,77 @@ export default function CriteriaPage() {
     setEditForm({ naam: c.naam, beschrijving: c.beschrijving, gewicht: c.gewicht });
   };
 
-  const saveEdit = (id: string) => {
+  const saveEdit = async (id: string) => {
     setCriteria((prev) =>
       prev.map((c) =>
         c.id === id
-          ? { ...c, naam: editForm.naam ?? c.naam, beschrijving: editForm.beschrijving, gewicht: editForm.gewicht ?? c.gewicht }
+          ? {
+              ...c,
+              naam: editForm.naam ?? c.naam,
+              beschrijving: editForm.beschrijving,
+              gewicht: editForm.gewicht ?? c.gewicht,
+            }
           : c
       )
     );
+    await supabase
+      .from('criteria')
+      .update({
+        naam: editForm.naam,
+        beschrijving: editForm.beschrijving ?? null,
+        gewicht: editForm.gewicht,
+      })
+      .eq('id', id);
     setEditingId(null);
   };
 
-  const deleteCriterium = (id: string) => {
+  const deleteCriterium = async (id: string) => {
     setCriteria((prev) => prev.filter((c) => c.id !== id));
+    await supabase.from('criteria').delete().eq('id', id);
   };
 
-  const addCriterium = () => {
+  const addCriterium = async () => {
     if (!newCriterium.naam) return;
-    const newId = Date.now().toString();
-    setCriteria((prev) => [
-      ...prev,
-      {
-        id: newId,
-        naam: newCriterium.naam!,
-        beschrijving: newCriterium.beschrijving,
+    const { data } = await supabase
+      .from('criteria')
+      .insert({
+        naam: newCriterium.naam,
+        beschrijving: newCriterium.beschrijving ?? null,
         gewicht: newCriterium.gewicht ?? 10,
         is_actief: true,
-        volgorde: prev.length + 1,
-      },
-    ]);
+        volgorde: criteria.length + 1,
+      })
+      .select()
+      .single();
+    if (data) {
+      setCriteria((prev) => [
+        ...prev,
+        {
+          id: data.id,
+          naam: data.naam,
+          beschrijving: data.beschrijving ?? undefined,
+          gewicht: Number(data.gewicht),
+          is_actief: data.is_actief,
+          volgorde: data.volgorde,
+        },
+      ]);
+    }
     setNewCriterium({ naam: '', beschrijving: '', gewicht: 10, is_actief: true });
     setShowAddDialog(false);
   };
+
+  if (loading) {
+    return (
+      <div className="space-y-6">
+        <div>
+          <Skeleton className="h-8 w-40" />
+          <Skeleton className="mt-2 h-4 w-72" />
+        </div>
+        <Skeleton className="h-48 w-full" />
+        <Skeleton className="h-64 w-full" />
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
@@ -253,7 +315,7 @@ export default function CriteriaPage() {
               {criteria.filter((c) => c.is_actief).length} actieve criteria
             </span>
             <Button size="sm" variant="outline" disabled={totalWeight !== 100}>
-              Wijzigingen opslaan
+              Wijzigingen opgeslagen
             </Button>
           </div>
         </CardContent>

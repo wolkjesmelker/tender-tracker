@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import {
   Plus,
   BrainCircuit,
@@ -19,6 +19,7 @@ import { Switch } from '@/components/ui/switch';
 import { Badge } from '@/components/ui/badge';
 import { Label } from '@/components/ui/label';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { Skeleton } from '@/components/ui/skeleton';
 import {
   Dialog,
   DialogContent,
@@ -35,51 +36,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { AIPrompt } from '@/types';
-
-const initialPrompts: AIPrompt[] = [
-  {
-    id: '1',
-    naam: 'Orchestrator v1',
-    type: 'orchestrator',
-    prompt_tekst:
-      'Je bent een aanbestedingsexpert. Analyseer de aanbestedingstekst en coördineer de andere agents om een complete analyse te produceren. Focus op: geschiktheid voor ons bedrijf, kansen, risicos en een aanbevelingsscore.',
-    versie: 1,
-    is_actief: true,
-    beschrijving: 'Hoofd-orchestrator voor de analyse pipeline',
-  },
-  {
-    id: '2',
-    naam: 'Samenvattings Agent',
-    type: 'agent',
-    agent_naam: 'summarizer',
-    prompt_tekst:
-      'Maak een beknopte samenvatting (max. 300 tekens) van de aanbestedingstekst. Vermeld: opdrachtgever, type opdracht, geschatte waarde en deadline.',
-    versie: 2,
-    is_actief: true,
-    beschrijving: 'Genereert een korte samenvatting van de aanbesteding',
-  },
-  {
-    id: '3',
-    naam: 'Score Agent',
-    type: 'agent',
-    agent_naam: 'scorer',
-    prompt_tekst:
-      'Beoordeel de aanbesteding op de volgende criteria en geef een score van 0-100 per criterium: Ervaring, Prijs, Planning, Duurzaamheid, Team kwaliteit. Geef ook een totaalscore.',
-    versie: 1,
-    is_actief: true,
-    beschrijving: 'Scoort de aanbesteding op basis van criteria',
-  },
-  {
-    id: '4',
-    naam: 'Kwaliteitscheck',
-    type: 'gatekeeper',
-    prompt_tekst:
-      'Controleer of de gegenereerde analyse volledig en correct is. Verificeer dat: alle criteria zijn gescoord, de samenvatting accuraat is, en geen hallucinaties aanwezig zijn. Keur de analyse goed of af.',
-    versie: 1,
-    is_actief: true,
-    beschrijving: 'Valideert de output van de analyse agents',
-  },
-];
+import { createClient } from '@/lib/supabase/client';
 
 const TYPE_LABELS: Record<AIPrompt['type'], string> = {
   orchestrator: 'Orchestrator',
@@ -100,7 +57,8 @@ const TYPE_DESCRIPTIONS: Record<AIPrompt['type'], string> = {
 };
 
 export default function AIPromptsPage() {
-  const [prompts, setPrompts] = useState<AIPrompt[]>(initialPrompts);
+  const [prompts, setPrompts] = useState<AIPrompt[]>([]);
+  const [loading, setLoading] = useState(true);
   const [showDialog, setShowDialog] = useState(false);
   const [editingPrompt, setEditingPrompt] = useState<AIPrompt | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
@@ -112,6 +70,34 @@ export default function AIPromptsPage() {
     beschrijving: '',
     is_actief: true,
   });
+
+  const supabase = createClient();
+
+  useEffect(() => {
+    async function load() {
+      const { data } = await supabase
+        .from('ai_prompts')
+        .select('*')
+        .order('type')
+        .order('naam');
+      if (data) {
+        setPrompts(
+          data.map((p) => ({
+            id: p.id,
+            naam: p.naam,
+            type: p.type as AIPrompt['type'],
+            agent_naam: p.agent_naam ?? undefined,
+            prompt_tekst: p.prompt_tekst,
+            versie: p.versie,
+            is_actief: p.is_actief,
+            beschrijving: p.beschrijving ?? undefined,
+          }))
+        );
+      }
+      setLoading(false);
+    }
+    load();
+  }, []);
 
   const openAdd = () => {
     setEditingPrompt(null);
@@ -125,42 +111,76 @@ export default function AIPromptsPage() {
     setShowDialog(true);
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     if (!form.naam || !form.prompt_tekst) return;
     if (editingPrompt) {
-      setPrompts((prev) =>
-        prev.map((p) =>
-          p.id === editingPrompt.id
-            ? { ...p, ...form, versie: p.versie + 1 } as AIPrompt
-            : p
-        )
-      );
+      const newVersie = editingPrompt.versie + 1;
+      const { data } = await supabase
+        .from('ai_prompts')
+        .update({
+          naam: form.naam,
+          type: form.type,
+          agent_naam: form.agent_naam ?? null,
+          prompt_tekst: form.prompt_tekst,
+          beschrijving: form.beschrijving ?? null,
+          versie: newVersie,
+        })
+        .eq('id', editingPrompt.id)
+        .select()
+        .single();
+      if (data) {
+        setPrompts((prev) =>
+          prev.map((p) =>
+            p.id === editingPrompt.id
+              ? { ...p, ...form, versie: newVersie } as AIPrompt
+              : p
+          )
+        );
+      }
     } else {
-      setPrompts((prev) => [
-        ...prev,
-        {
-          id: Date.now().toString(),
-          naam: form.naam!,
-          type: form.type as AIPrompt['type'],
-          agent_naam: form.agent_naam,
-          prompt_tekst: form.prompt_tekst!,
-          beschrijving: form.beschrijving,
+      const { data } = await supabase
+        .from('ai_prompts')
+        .insert({
+          naam: form.naam,
+          type: form.type ?? 'agent',
+          agent_naam: form.agent_naam ?? null,
+          prompt_tekst: form.prompt_tekst,
+          beschrijving: form.beschrijving ?? null,
           versie: 1,
           is_actief: form.is_actief ?? true,
-        },
-      ]);
+        })
+        .select()
+        .single();
+      if (data) {
+        setPrompts((prev) => [
+          ...prev,
+          {
+            id: data.id,
+            naam: data.naam,
+            type: data.type as AIPrompt['type'],
+            agent_naam: data.agent_naam ?? undefined,
+            prompt_tekst: data.prompt_tekst,
+            versie: data.versie,
+            is_actief: data.is_actief,
+            beschrijving: data.beschrijving ?? undefined,
+          },
+        ]);
+      }
     }
     setShowDialog(false);
   };
 
-  const handleDelete = (id: string) => {
+  const handleDelete = async (id: string) => {
     setPrompts((prev) => prev.filter((p) => p.id !== id));
+    await supabase.from('ai_prompts').delete().eq('id', id);
   };
 
-  const toggleActive = (id: string) => {
-    setPrompts((prev) =>
-      prev.map((p) => (p.id === id ? { ...p, is_actief: !p.is_actief } : p))
-    );
+  const toggleActive = async (id: string) => {
+    const p = prompts.find((x) => x.id === id);
+    if (!p) return;
+    const newVal = !p.is_actief;
+    setPrompts((prev) => prev.map((x) => (x.id === id ? { ...x, is_actief: newVal } : x)));
+    await supabase.from('ai_prompts').update({ is_actief: newVal }).eq('id', id);
   };
 
   const copyPrompt = (id: string, tekst: string) => {
@@ -169,11 +189,10 @@ export default function AIPromptsPage() {
     setTimeout(() => setCopiedId(null), 2000);
   };
 
+  const byType = (type: AIPrompt['type']) => prompts.filter((p) => p.type === type);
+
   const renderPromptCard = (prompt: AIPrompt) => (
-    <Card
-      key={prompt.id}
-      className={`transition-opacity ${!prompt.is_actief ? 'opacity-60' : ''}`}
-    >
+    <Card key={prompt.id} className={`transition-opacity ${!prompt.is_actief ? 'opacity-60' : ''}`}>
       <CardHeader className="pb-3">
         <div className="flex items-start justify-between gap-3">
           <div className="flex-1 min-w-0">
@@ -182,14 +201,10 @@ export default function AIPromptsPage() {
               <Badge variant="outline" className={`shrink-0 border text-[10px] ${TYPE_COLORS[prompt.type]}`}>
                 {TYPE_LABELS[prompt.type]}
               </Badge>
-              <Badge variant="secondary" className="shrink-0 text-[10px]">
-                v{prompt.versie}
-              </Badge>
+              <Badge variant="secondary" className="shrink-0 text-[10px]">v{prompt.versie}</Badge>
             </div>
             {prompt.beschrijving && (
-              <CardDescription className="mt-1 text-xs">
-                {prompt.beschrijving}
-              </CardDescription>
+              <CardDescription className="mt-1 text-xs">{prompt.beschrijving}</CardDescription>
             )}
             {prompt.agent_naam && (
               <p className="mt-1 font-mono text-[10px] text-muted-foreground">
@@ -197,10 +212,7 @@ export default function AIPromptsPage() {
               </p>
             )}
           </div>
-          <Switch
-            checked={prompt.is_actief}
-            onCheckedChange={() => toggleActive(prompt.id)}
-          />
+          <Switch checked={prompt.is_actief} onCheckedChange={() => toggleActive(prompt.id)} />
         </div>
       </CardHeader>
       <CardContent className="space-y-3">
@@ -217,23 +229,12 @@ export default function AIPromptsPage() {
             onClick={() => copyPrompt(prompt.id, prompt.prompt_tekst)}
           >
             {copiedId === prompt.id ? (
-              <>
-                <Check className="mr-1.5 size-3 text-green-600" />
-                Gekopieerd
-              </>
+              <><Check className="mr-1.5 size-3 text-green-600" />Gekopieerd</>
             ) : (
-              <>
-                <Copy className="mr-1.5 size-3" />
-                Kopieer
-              </>
+              <><Copy className="mr-1.5 size-3" />Kopieer</>
             )}
           </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-7"
-            onClick={() => openEdit(prompt)}
-          >
+          <Button variant="ghost" size="icon" className="size-7" onClick={() => openEdit(prompt)}>
             <Pencil className="size-3.5" />
           </Button>
           <Button
@@ -249,17 +250,27 @@ export default function AIPromptsPage() {
     </Card>
   );
 
-  const byType = (type: AIPrompt['type']) =>
-    prompts.filter((p) => p.type === type);
+  if (loading) {
+    return (
+      <div className="space-y-6">
+        <div>
+          <Skeleton className="h-8 w-36" />
+          <Skeleton className="mt-2 h-4 w-64" />
+        </div>
+        <Skeleton className="h-32 w-full" />
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {[1, 2, 3, 4].map((i) => <Skeleton key={i} className="h-56" />)}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold tracking-tight">AI Prompts</h1>
-          <p className="text-muted-foreground">
-            Beheer de AI prompts voor de analyse pipeline
-          </p>
+          <p className="text-muted-foreground">Beheer de AI prompts voor de analyse pipeline</p>
         </div>
         <Button size="sm" onClick={openAdd}>
           <Plus className="mr-2 size-3.5" />
@@ -285,9 +296,7 @@ export default function AIPromptsPage() {
                     {byType(type).filter((p) => p.is_actief).length} actief
                   </p>
                 </div>
-                {idx < arr.length - 1 && (
-                  <div className="h-px w-6 bg-border" />
-                )}
+                {idx < arr.length - 1 && <div className="h-px w-6 bg-border" />}
               </div>
             ))}
           </div>
@@ -302,7 +311,7 @@ export default function AIPromptsPage() {
         </CardContent>
       </Card>
 
-      {/* Tabs per type */}
+      {/* Tabs */}
       <Tabs defaultValue="orchestrator">
         <TabsList>
           {(['orchestrator', 'agent', 'gatekeeper'] as const).map((type) => (
@@ -322,12 +331,8 @@ export default function AIPromptsPage() {
               <div className="flex flex-col items-center gap-3 rounded-lg border border-dashed py-12 text-center">
                 <BrainCircuit className="size-10 text-muted-foreground/40" />
                 <div>
-                  <p className="text-sm font-medium">
-                    Geen {TYPE_LABELS[type].toLowerCase()} prompts
-                  </p>
-                  <p className="text-xs text-muted-foreground">
-                    Voeg een prompt toe om te beginnen
-                  </p>
+                  <p className="text-sm font-medium">Geen {TYPE_LABELS[type].toLowerCase()} prompts</p>
+                  <p className="text-xs text-muted-foreground">Voeg een prompt toe om te beginnen</p>
                 </div>
                 <Button size="sm" onClick={openAdd}>
                   <Plus className="mr-1.5 size-3.5" />
@@ -370,18 +375,14 @@ export default function AIPromptsPage() {
                 <Label>Type *</Label>
                 <Select
                   value={form.type ?? 'agent'}
-                  onValueChange={(v) =>
-                    setForm((f) => ({ ...f, type: v as AIPrompt['type'] }))
-                  }
+                  onValueChange={(v) => setForm((f) => ({ ...f, type: v as AIPrompt['type'] }))}
                 >
                   <SelectTrigger>
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
                     {(['orchestrator', 'agent', 'gatekeeper'] as const).map((t) => (
-                      <SelectItem key={t} value={t}>
-                        {TYPE_LABELS[t]}
-                      </SelectItem>
+                      <SelectItem key={t} value={t}>{TYPE_LABELS[t]}</SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
@@ -393,9 +394,7 @@ export default function AIPromptsPage() {
                 <Input
                   placeholder="bijv. summarizer"
                   value={form.agent_naam ?? ''}
-                  onChange={(e) =>
-                    setForm((f) => ({ ...f, agent_naam: e.target.value }))
-                  }
+                  onChange={(e) => setForm((f) => ({ ...f, agent_naam: e.target.value }))}
                 />
               </div>
             )}
@@ -404,9 +403,7 @@ export default function AIPromptsPage() {
               <Input
                 placeholder="Korte omschrijving van de functie"
                 value={form.beschrijving ?? ''}
-                onChange={(e) =>
-                  setForm((f) => ({ ...f, beschrijving: e.target.value }))
-                }
+                onChange={(e) => setForm((f) => ({ ...f, beschrijving: e.target.value }))}
               />
             </div>
             <div className="space-y-1.5">
@@ -414,9 +411,7 @@ export default function AIPromptsPage() {
               <Textarea
                 placeholder="Schrijf hier de systeemprompt…"
                 value={form.prompt_tekst ?? ''}
-                onChange={(e) =>
-                  setForm((f) => ({ ...f, prompt_tekst: e.target.value }))
-                }
+                onChange={(e) => setForm((f) => ({ ...f, prompt_tekst: e.target.value }))}
                 className="min-h-40 resize-none font-mono text-xs"
               />
             </div>
@@ -426,10 +421,7 @@ export default function AIPromptsPage() {
               <X className="mr-1.5 size-3.5" />
               Annuleren
             </Button>
-            <Button
-              onClick={handleSave}
-              disabled={!form.naam || !form.prompt_tekst}
-            >
+            <Button onClick={handleSave} disabled={!form.naam || !form.prompt_tekst}>
               <Check className="mr-1.5 size-3.5" />
               {editingPrompt ? 'Opslaan' : 'Toevoegen'}
             </Button>
