@@ -57,6 +57,56 @@ export interface AIPrompt {
   beschrijving?: string;
 }
 
+export type AnalyseSessieStatus = 'nieuw' | 'analyse_bezig' | 'gereed' | 'fout';
+
+export interface SessieMetadata {
+  opdrachtgever?: string;
+  sluitingsdatum?: string;
+  publicatiedatum?: string;
+  referentienummer?: string;
+  type_opdracht?: string;
+  regio?: string;
+  waarde?: string;
+}
+
+export interface AnalyseSessie {
+  id: string;
+  naam: string;
+  status: AnalyseSessieStatus;
+  notities?: string;
+  ai_samenvatting?: string;
+  metadata?: SessieMetadata;
+  criteria_scores?: Record<string, number>;
+  totaal_score?: number;
+  aantal_bestanden: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SessieBestand {
+  id: string;
+  sessie_id: string;
+  naam: string;
+  storage_path: string;
+  mime_type?: string;
+  grootte?: number;
+  created_at: string;
+}
+
+export const SESSIE_STATUS_LABELS: Record<AnalyseSessieStatus, string> = {
+  nieuw: 'Nieuw',
+  analyse_bezig: 'Analyse bezig',
+  gereed: 'Gereed',
+  fout: 'Fout',
+};
+
+export const SESSIE_STATUS_COLORS: Record<AnalyseSessieStatus, string> = {
+  nieuw: 'bg-slate-100 text-slate-700 border-slate-200',
+  analyse_bezig: 'bg-blue-100 text-blue-700 border-blue-200',
+  gereed: 'bg-green-100 text-green-700 border-green-200',
+  fout: 'bg-red-100 text-red-700 border-red-200',
+};
+
 export type AanbestedingStatus = Aanbesteding['status'];
 
 export const STATUS_LABELS: Record<AanbestedingStatus, string> = {

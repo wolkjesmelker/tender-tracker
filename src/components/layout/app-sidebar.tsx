@@ -10,6 +10,7 @@ import {
   BrainCircuit,
   ChevronRight,
   Building2,
+  ScanSearch,
 } from 'lucide-react';
 
 import {
@@ -32,6 +33,11 @@ const navItems = [
     title: 'Dashboard',
     href: '/',
     icon: LayoutDashboard,
+  },
+  {
+    title: 'Analyse',
+    href: '/analyse',
+    icon: ScanSearch,
   },
   {
     title: 'Aanbestedingen',

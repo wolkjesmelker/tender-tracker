@@ -87,6 +87,85 @@ export type Database = {
         }
         Relationships: []
       }
+      analyse_sessies: {
+        Row: {
+          id: string
+          naam: string
+          status: string
+          notities: string | null
+          ai_samenvatting: string | null
+          metadata: Json | null
+          criteria_scores: Json | null
+          totaal_score: number | null
+          aantal_bestanden: number
+          created_at: string
+          updated_at: string
+        }
+        Insert: {
+          id?: string
+          naam: string
+          status?: string
+          notities?: string | null
+          ai_samenvatting?: string | null
+          metadata?: Json | null
+          criteria_scores?: Json | null
+          totaal_score?: number | null
+          aantal_bestanden?: number
+          created_at?: string
+          updated_at?: string
+        }
+        Update: {
+          id?: string
+          naam?: string
+          status?: string
+          notities?: string | null
+          ai_samenvatting?: string | null
+          metadata?: Json | null
+          criteria_scores?: Json | null
+          totaal_score?: number | null
+          aantal_bestanden?: number
+          created_at?: string
+          updated_at?: string
+        }
+        Relationships: []
+      }
+      sessie_bestanden: {
+        Row: {
+          id: string
+          sessie_id: string
+          naam: string
+          storage_path: string
+          mime_type: string | null
+          grootte: number | null
+          created_at: string
+        }
+        Insert: {
+          id?: string
+          sessie_id: string
+          naam: string
+          storage_path: string
+          mime_type?: string | null
+          grootte?: number | null
+          created_at?: string
+        }
+        Update: {
+          id?: string
+          sessie_id?: string
+          naam?: string
+          storage_path?: string
+          mime_type?: string | null
+          grootte?: number | null
+          created_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "sessie_bestanden_sessie_id_fkey"
+            columns: ["sessie_id"]
+            referencedRelation: "analyse_sessies"
+            referencedColumns: ["id"]
+          }
+        ]
+      }
       ai_prompts: {
         Row: {
           agent_naam: string | null

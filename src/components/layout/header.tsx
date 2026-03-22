@@ -27,6 +27,7 @@ import { cn } from '@/lib/utils';
 
 const ROUTE_LABELS: Record<string, string> = {
   '': 'Dashboard',
+  analyse: 'Analyse',
   aanbestedingen: 'Aanbestedingen',
   criteria: 'Criteria',
   bronnen: 'Bronnen',
