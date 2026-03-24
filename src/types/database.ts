@@ -129,6 +129,60 @@ export type Database = {
         }
         Relationships: []
       }
+      scrape_jobs: {
+        Row: {
+          id: string
+          bron_id: string | null
+          bron_naam: string
+          bron_url: string
+          zoekterm: string | null
+          status: string
+          resultaten: Json | null
+          aantal_gevonden: number
+          fout_melding: string | null
+          triggered_by: string
+          started_at: string | null
+          completed_at: string | null
+          created_at: string
+        }
+        Insert: {
+          id?: string
+          bron_id?: string | null
+          bron_naam: string
+          bron_url: string
+          zoekterm?: string | null
+          status?: string
+          resultaten?: Json | null
+          aantal_gevonden?: number
+          fout_melding?: string | null
+          triggered_by?: string
+          started_at?: string | null
+          completed_at?: string | null
+          created_at?: string
+        }
+        Update: {
+          id?: string
+          bron_id?: string | null
+          bron_naam?: string
+          bron_url?: string
+          zoekterm?: string | null
+          status?: string
+          resultaten?: Json | null
+          aantal_gevonden?: number
+          fout_melding?: string | null
+          triggered_by?: string
+          started_at?: string | null
+          completed_at?: string | null
+          created_at?: string
+        }
+        Relationships: []
+      }
+      app_settings: {
+        Row: { key: string; value: string; updated_at: string }
+        Insert: { key: string; value: string; updated_at?: string }
+        Update: { key?: string; value?: string; updated_at?: string }
+        Relationships: []
+      }
       sessie_bestanden: {
         Row: {
           id: string

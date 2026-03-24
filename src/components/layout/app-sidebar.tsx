@@ -11,6 +11,7 @@ import {
   ChevronRight,
   Building2,
   ScanSearch,
+  Bot,
 } from 'lucide-react';
 
 import {
@@ -48,6 +49,11 @@ const navItems = [
     title: 'Criteria',
     href: '/criteria',
     icon: ListChecks,
+  },
+  {
+    title: 'Scrapen',
+    href: '/scrapen',
+    icon: Bot,
   },
   {
     title: 'Bronnen',

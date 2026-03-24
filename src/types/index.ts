@@ -107,6 +107,24 @@ export const SESSIE_STATUS_COLORS: Record<AnalyseSessieStatus, string> = {
   fout: 'bg-red-100 text-red-700 border-red-200',
 };
 
+export type ScrapeJobStatus = 'wachtend' | 'bezig' | 'gereed' | 'fout';
+
+export interface ScrapeJob {
+  id: string;
+  bron_id?: string;
+  bron_naam: string;
+  bron_url: string;
+  zoekterm?: string;
+  status: ScrapeJobStatus;
+  resultaten?: Record<string, unknown>[];
+  aantal_gevonden: number;
+  fout_melding?: string;
+  triggered_by: string;
+  started_at?: string;
+  completed_at?: string;
+  created_at: string;
+}
+
 export type AanbestedingStatus = Aanbesteding['status'];
 
 export const STATUS_LABELS: Record<AanbestedingStatus, string> = {
