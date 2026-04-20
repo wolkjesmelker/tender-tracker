@@ -75,12 +75,22 @@ class ClaudeProvider implements AIProvider {
 /**
  * Kimi (Moonshot) — OpenAI-compatibel chat/completions endpoint.
  * @see https://platform.moonshot.cn/docs
+ *
+ * k2.5 / k2.6 vereisen vaste parameter-waarden:
+ *  - temperature: 1.0 (thinking) of 0.6 (non-thinking) — andere waarden geven een API-error
+ *  - top_p: 0.95, n: 1, presence_penalty: 0.0, frequency_penalty: 0.0 — idem
+ * Stuur deze parameters dus NIET mee; laat de API zijn defaults hanteren.
  */
 class MoonshotProvider implements AIProvider {
   readonly name = 'Kimi (Moonshot)'
   private apiKey: string
   private model: string
   private baseUrl: string
+
+  /** True als het model vaste-param-beperkingen heeft (k2.5 / k2.6). */
+  private get isConstrainedModel(): boolean {
+    return this.model.includes('k2.5') || this.model.includes('k2.6')
+  }
 
   constructor(
     apiKey: string,
@@ -96,10 +106,17 @@ class MoonshotProvider implements AIProvider {
     const body: Record<string, unknown> = {
       model: this.model,
       messages,
-      max_tokens: 16384,
+      // k2.6 standaard max_tokens is 32768; voor andere modellen houden we 16384
+      max_tokens: this.isConstrainedModel ? 32768 : 16384,
     }
+
     if (options?.preferJsonOutput) {
       body.response_format = { type: 'json_object' }
+      // Bij k2.5/k2.6: thinking uitschakelen voor gestructureerde JSON-output
+      // (thinking-mode en response_format kunnen conflicteren, + sneller/goedkoper)
+      if (this.isConstrainedModel) {
+        body.thinking = { type: 'disabled' }
+      }
     }
 
     const endpoint = `${this.baseUrl}/chat/completions`
@@ -215,7 +232,7 @@ class KimiCliProvider implements AIProvider {
       KIMI_API_KEY: this.apiKey,
       KIMI_BASE_URL: this.baseUrl,
       KIMI_CLI_NO_AUTO_UPDATE: '1',
-      KIMI_MODEL_MAX_TOKENS: '16384',
+      KIMI_MODEL_MAX_TOKENS: this.model.includes('k2.5') || this.model.includes('k2.6') ? '32768' : '16384',
     }
 
     const stdout = await new Promise<string>((resolve, reject) => {
