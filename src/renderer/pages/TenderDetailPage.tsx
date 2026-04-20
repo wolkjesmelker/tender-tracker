@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import { useParams, useNavigate } from 'react-router-dom'
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import { useTender, useAsyncData } from '../hooks/use-ipc'
 import { api, isElectron } from '../lib/ipc-client'
 import { formatDate, getScoreColor, getStatusLabel, getStatusColor } from '../lib/utils'
@@ -444,6 +444,8 @@ function getFileIcon(name: string, docType?: string) {
 export function TenderDetailPage() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  const tabParam = searchParams.get('tab') as 'overzicht' | 'inschrijving' | 'risico' | null
   const { data: tender, loading, refresh } = useTender(id!)
   const { data: questions } = useAsyncData(() => api.getAIVragen(), [])
   const [analyzing, setAnalyzing] = useState(false)
@@ -464,11 +466,15 @@ export function TenderDetailPage() {
   const [localPreviewFile, setLocalPreviewFile] = useState<{ naam: string; size: number } | null>(null)
   /** Bron-URL uit document_urls — zelfde preview-modal als lokale bestanden */
   const [bronPreview, setBronPreview] = useState<{ url: string; naam: string } | null>(null)
+  /** Keys of documents that failed both in-app preview and external open; filtered from lists. */
+  const [unavailableDocKeys, setUnavailableDocKeys] = useState<Set<string>>(new Set())
   const [bronPageEmbed, setBronPageEmbed] = useState<{ url: string; title: string } | null>(null)
   const [localDocSaving, setLocalDocSaving] = useState<string | null>(null)
   const [localOpenError, setLocalOpenError] = useState('')
   const [localAnalysePanelOpen, setLocalAnalysePanelOpen] = useState(false)
-  const [activeTab, setActiveTab] = useState<'overzicht' | 'inschrijving' | 'risico'>('overzicht')
+  const [activeTab, setActiveTab] = useState<'overzicht' | 'inschrijving' | 'risico'>(
+    tabParam === 'inschrijving' || tabParam === 'risico' ? tabParam : 'overzicht'
+  )
   const [docSearch, setDocSearch] = useState('')
   const [docSortBy, setDocSortBy] = useState<'naam' | 'type'>('naam')
   const [docTypeFilter, setDocTypeFilter] = useState<string | null>(null)
@@ -725,6 +731,7 @@ export function TenderDetailPage() {
     documenten = []
   }
   documenten = hideZipRowIfContentsExpanded(documenten)
+    .filter((d) => !unavailableDocKeys.has(d.url ?? '') && !unavailableDocKeys.has(d.localNaam ?? ''))
 
   const _getDocExt = (naam: string, type?: string) =>
     (type || naam.split('.').pop() || '').toUpperCase()
@@ -751,7 +758,7 @@ export function TenderDetailPage() {
   const catalogLocalNames = new Set(
     documenten.map((d) => d.localNaam).filter((n): n is string => Boolean(n?.trim()))
   )
-  const orphanLocalFiles = localFiles.filter((f) => !catalogLocalNames.has(f.naam))
+  const orphanLocalFiles = localFiles.filter((f) => !catalogLocalNames.has(f.naam) && !unavailableDocKeys.has(f.naam))
 
   let procedureContext: TenderProcedureContext | null = null
   try {
@@ -798,7 +805,7 @@ export function TenderDetailPage() {
   const isFileUrl = (url: string) => FILE_EXTS.test(url.split('?')[0].split('#')[0])
 
   /** Splits bronNavLinks in bestandslinks (→ documentenpaneel) en paginalinks (→ beschrijving) */
-  const bronFileLinks = bronNavLinks.filter(l => isFileUrl(l.url))
+  const bronFileLinks = bronNavLinks.filter(l => isFileUrl(l.url) && !unavailableDocKeys.has(l.url))
   const bronPageLinks = bronNavLinks.filter(l => !isFileUrl(l.url))
 
   const _docSearchQ = docSearch.trim().toLowerCase()
@@ -1028,6 +1035,12 @@ export function TenderDetailPage() {
             : null
         }
         onClose={() => {
+          setLocalPreviewFile(null)
+          setBronPreview(null)
+        }}
+        onUnavailable={() => {
+          const key = bronPreview?.url ?? localPreviewFile?.naam
+          if (key) setUnavailableDocKeys((prev) => new Set([...prev, key]))
           setLocalPreviewFile(null)
           setBronPreview(null)
         }}
@@ -1459,16 +1472,16 @@ export function TenderDetailPage() {
                       const hasDetails = toelichting || brontekst
 
                       const statusConfig: Record<string, { icon: typeof CircleCheck, color: string, bgColor: string, borderColor: string, label: string }> = {
-                        match: { icon: CircleCheck, color: 'text-green-600 dark:text-green-400', bgColor: 'bg-green-50 dark:bg-green-950/30', borderColor: 'border-green-200 dark:border-green-700/50', label: 'Match' },
-                        gedeeltelijk: { icon: CircleDot, color: 'text-yellow-600 dark:text-yellow-400', bgColor: 'bg-yellow-50 dark:bg-yellow-950/30', borderColor: 'border-yellow-200 dark:border-yellow-700/50', label: 'Gedeeltelijk' },
-                        niet_aanwezig: { icon: CircleMinus, color: 'text-gray-400 dark:text-gray-500', bgColor: 'bg-gray-50 dark:bg-gray-800/30', borderColor: 'border-gray-200 dark:border-gray-700/50', label: 'Niet aanwezig' },
+                        match: { icon: CircleCheck, color: 'text-green-700 dark:text-green-400', bgColor: 'bg-green-50 dark:bg-green-950/30', borderColor: 'border-green-200 dark:border-green-700/50', label: 'Match' },
+                        gedeeltelijk: { icon: CircleDot, color: 'text-yellow-700 dark:text-yellow-400', bgColor: 'bg-yellow-50 dark:bg-yellow-950/30', borderColor: 'border-yellow-200 dark:border-yellow-700/50', label: 'Gedeeltelijk' },
+                        niet_aanwezig: { icon: CircleMinus, color: 'text-gray-500 dark:text-gray-500', bgColor: 'bg-gray-100 dark:bg-gray-800/30', borderColor: 'border-gray-200 dark:border-gray-700/50', label: 'Niet aanwezig' },
                         risico: { icon: CircleX, color: 'text-red-600 dark:text-red-400', bgColor: 'bg-red-50 dark:bg-red-950/30', borderColor: 'border-red-200 dark:border-red-700/50', label: 'Risico' },
                       }
                       const config = statusConfig[status] || statusConfig.niet_aanwezig
                       const Icon = config.icon
 
                       return (
-                        <div key={key} className={`rounded-lg border ${isExpanded ? config.borderColor : 'border-transparent'} ${config.bgColor} transition-all`}>
+                        <div key={key} className={`rounded-lg border ${config.borderColor} ${config.bgColor} transition-all`}>
                           <button
                             onClick={() => {
                               if (!hasDetails) return
