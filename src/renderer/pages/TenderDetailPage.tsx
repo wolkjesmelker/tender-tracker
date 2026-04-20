@@ -1472,10 +1472,10 @@ export function TenderDetailPage() {
                       const hasDetails = toelichting || brontekst
 
                       const statusConfig: Record<string, { icon: typeof CircleCheck, color: string, bgColor: string, borderColor: string, label: string }> = {
-                        match: { icon: CircleCheck, color: 'text-green-800 dark:text-green-400', bgColor: 'bg-[#dcfce7] dark:bg-green-950/30', borderColor: 'border-[#86efac] dark:border-green-700/50', label: 'Match' },
-                        gedeeltelijk: { icon: CircleDot, color: 'text-amber-800 dark:text-yellow-400', bgColor: 'bg-[#fef3c7] dark:bg-yellow-950/30', borderColor: 'border-[#fcd34d] dark:border-yellow-700/50', label: 'Gedeeltelijk' },
-                        niet_aanwezig: { icon: CircleMinus, color: 'text-gray-500 dark:text-gray-500', bgColor: 'bg-[#f3f4f6] dark:bg-gray-800/30', borderColor: 'border-[#d1d5db] dark:border-gray-700/50', label: 'Niet aanwezig' },
-                        risico: { icon: CircleX, color: 'text-red-700 dark:text-red-400', bgColor: 'bg-[#fee2e2] dark:bg-red-950/30', borderColor: 'border-[#fca5a5] dark:border-red-700/50', label: 'Risico' },
+                        match: { icon: CircleCheck, color: 'text-green-800 dark:text-green-400', bgColor: 'bg-[#bbf7d0] dark:bg-green-950/30', borderColor: 'border-[#4ade80] dark:border-green-700/50', label: 'Match' },
+                        gedeeltelijk: { icon: CircleDot, color: 'text-amber-800 dark:text-yellow-400', bgColor: 'bg-[#fde68a] dark:bg-yellow-950/30', borderColor: 'border-[#f59e0b] dark:border-yellow-700/50', label: 'Gedeeltelijk' },
+                        niet_aanwezig: { icon: CircleMinus, color: 'text-gray-600 dark:text-gray-500', bgColor: 'bg-[#e5e7eb] dark:bg-gray-800/30', borderColor: 'border-[#9ca3af] dark:border-gray-700/50', label: 'Niet aanwezig' },
+                        risico: { icon: CircleX, color: 'text-red-700 dark:text-red-400', bgColor: 'bg-[#fecaca] dark:bg-red-950/30', borderColor: 'border-[#f87171] dark:border-red-700/50', label: 'Risico' },
                       }
                       const config = statusConfig[status] || statusConfig.niet_aanwezig
                       const Icon = config.icon
