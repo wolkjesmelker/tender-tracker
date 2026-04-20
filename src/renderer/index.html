@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html lang="nl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- Geen meta-CSP: Vite dev injecteert inline <script type="module"> (React Refresh); onder CSP3 telt 'unsafe-inline' daarvoor niet → wit scherm in browser. Beperk eventueel CSP later via Electron session of build-stap. -->
+    <title>TenderTracker - Van de Kreeke Groep</title>
+  </head>
+  <body class="bg-background text-foreground">
+    <div id="root"></div>
+    <script type="module" src="./main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,101 @@
+appId: com.questric.tender-tracker
+productName: TenderTracker
+copyright: "Copyright © 2026 Questric. Alle rechten voorbehouden. Onbevoegde verspreiding of kopiëren is verboden."
+
+directories:
+  output: release
+  buildResources: resources
+
+files:
+  - dist-electron
+  - dist
+  - package.json
+  - "node_modules/**"
+  - "!node_modules/.cache"
+  - "!node_modules/.package-lock.json"
+
+asar: false
+npmRebuild: false
+afterPack: scripts/after-pack.js
+
+# ── Auto-update ──────────────────────────────────────────────────────────────
+# Upload de inhoud van ./release handmatig naar deze URL na het bouwen.
+# Of gebruik: npm run release:publish (vereist schrijftoegang tot de server)
+# Zie RELEASE.md voor de volledige workflow.
+publish:
+  provider: generic
+  url: https://releases.questric.eu/tendertracker/
+
+# ── macOS ────────────────────────────────────────────────────────────────────
+mac:
+  target:
+    - target: dmg
+      arch: [x64, arm64]
+    - target: zip
+      arch: [x64, arm64]
+  icon: resources/icon.icns
+  category: public.app-category.business
+  artifactName: "TenderTracker-${version}-mac-${arch}.${ext}"
+  darkModeSupport: true
+  # Zonder code-signing: gebruikers moeten bij eerste start
+  # rechtermuisknop → Openen kiezen (macOS Gatekeeper).
+  # Met Apple Developer-certificaat: stel CSC_LINK en CSC_KEY_PASSWORD in.
+  hardenedRuntime: false
+  gatekeeperAssess: false
+
+dmg:
+  title: "TenderTracker ${version}"
+  background: resources/dmg-background.png
+  icon: resources/icon.icns
+  iconSize: 80
+  artifactName: "TenderTracker-${version}-mac-${arch}.dmg"
+  window:
+    width: 540
+    height: 380
+  contents:
+    - x: 130
+      y: 190
+      type: file
+    - x: 410
+      y: 190
+      type: link
+      path: /Applications
+
+# ── Windows ──────────────────────────────────────────────────────────────────
+win:
+  target:
+    - nsis
+  icon: resources/icon.ico
+  artifactName: "TenderTracker-${version}-win-${arch}.${ext}"
+  publisherName: Questric
+  legalTrademarks: "TenderTracker is een handelsmerk van Questric"
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  installerIcon: resources/icon.ico
+  uninstallerIcon: resources/icon.ico
+  installerHeaderIcon: resources/icon.ico
+  installerHeader: resources/installer-header.bmp
+  installerSidebar: resources/installer-sidebar.bmp
+  artifactName: "TenderTracker-${version}-Setup.exe"
+  shortcutName: TenderTracker
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  menuCategory: Questric
+  displayLanguageSelector: false
+  language: "1043"
+  include: resources/installer.nsh
+
+# ── Linux ────────────────────────────────────────────────────────────────────
+linux:
+  target:
+    - AppImage
+    - deb
+  icon: resources/icon.png
+  category: Office
+  artifactName: "TenderTracker-${version}-linux-${arch}.${ext}"
+  desktop:
+    Name: TenderTracker
+    Comment: Aanbestedingen monitoring platform — door Questric voor Van de Kreeke Groep
+    Categories: Office;ProjectManagement
