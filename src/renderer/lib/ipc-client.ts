@@ -75,6 +75,7 @@ const METHOD_TO_CHANNEL: Record<string, string> = {
   startRisicoAnalyse: 'risico:start',
   requestRisicoUiReplay: 'risico:ui-replay',
   getTokenStats: 'tokens:get-stats',
+  resetTokenStats: 'tokens:reset',
   getAiDiagnosticsSnapshot: 'diagnostics:ai-snapshot',
   getSetting: 'settings:get',
   setSetting: 'settings:set',

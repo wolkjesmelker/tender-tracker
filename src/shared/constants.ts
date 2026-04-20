@@ -91,6 +91,7 @@ export const IPC = {
 
   // Token statistieken
   TOKENS_GET_STATS: 'tokens:get-stats',
+  TOKENS_RESET: 'tokens:reset',
 
   /** Intern: AI-/risico-diagnose (geen secrets in response). */
   AI_DIAGNOSTICS_SNAPSHOT: 'diagnostics:ai-snapshot',

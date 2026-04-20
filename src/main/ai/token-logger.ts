@@ -76,6 +76,16 @@ export function logTokenUsage(
   }
 }
 
+/** Verwijdert alle token-usage records uit de database. */
+export function resetTokenStats(): void {
+  try {
+    const d = getDb()
+    d.prepare('DELETE FROM ai_token_usage').run()
+  } catch (e) {
+    log.warn('[token-logger] resetTokenStats fout:', e)
+  }
+}
+
 /** Returns aggregated token stats from the DB. */
 export function getTokenStats(): TokenStats {
   const empty: TokenStats = {

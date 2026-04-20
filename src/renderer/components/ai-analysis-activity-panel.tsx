@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react'
-import { X, Terminal, Cpu, BarChart2, Settings2 } from 'lucide-react'
+import { X, Terminal, Cpu, BarChart2, Settings2, RotateCcw } from 'lucide-react'
 import { api } from '../lib/ipc-client'
 import { buildConfiguredMainAgentLabel, buildRisicoModelDisplay } from '../../shared/ai-display'
 import { estimateTokenCostEur, formatEurIndicative } from '../../shared/ai-pricing'
@@ -56,6 +56,8 @@ export function AiAnalysisActivityPanel({ open, onClose, lines, active }: Props)
   const [tokenStats, setTokenStats] = useState<TokenStats | null>(null)
   const [settings, setSettings] = useState<Record<string, string> | null>(null)
   const [statsError, setStatsError] = useState(false)
+  const [resetConfirm, setResetConfirm] = useState(false)
+  const [resetting, setResetting] = useState(false)
 
   const fetchStats = useCallback(async () => {
     setStatsError(false)
@@ -93,6 +95,19 @@ export function AiAnalysisActivityPanel({ open, onClose, lines, active }: Props)
     if (!el) return
     el.scrollTop = el.scrollHeight
   }, [open, lines])
+
+  const handleReset = useCallback(async () => {
+    if (!resetConfirm) { setResetConfirm(true); return }
+    setResetting(true)
+    try {
+      await api.resetTokenStats()
+      setTokenStats(null)
+      await fetchStats()
+    } finally {
+      setResetting(false)
+      setResetConfirm(false)
+    }
+  }, [resetConfirm, fetchStats])
 
   if (!open) return null
 
@@ -353,6 +368,24 @@ export function AiAnalysisActivityPanel({ open, onClose, lines, active }: Props)
               </p>
             </div>
           )}
+        </div>
+
+        {/* Reset button */}
+        <div className="border-t border-white/[0.06] pt-2.5">
+          <button
+            type="button"
+            onClick={handleReset}
+            onBlur={() => setResetConfirm(false)}
+            disabled={resetting}
+            className={`flex w-full items-center justify-center gap-1.5 rounded-md px-3 py-1.5 text-[10px] font-semibold transition-colors ${
+              resetConfirm
+                ? 'bg-red-900/60 text-red-200 hover:bg-red-800/70 border border-red-700/50'
+                : 'bg-white/[0.04] text-emerald-200/50 hover:bg-white/[0.08] hover:text-emerald-200/80 border border-white/[0.06]'
+            }`}
+          >
+            <RotateCcw className={`h-3 w-3 ${resetting ? 'animate-spin' : ''}`} />
+            {resetConfirm ? 'Zeker weten? Klik nogmaals om te resetten' : 'Tokenverbruik resetten'}
+          </button>
         </div>
       </div>
     </div>
