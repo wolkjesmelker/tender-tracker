@@ -163,6 +163,7 @@ const electronAPI = {
 
   // Token statistieken
   getTokenStats: () => ipcRenderer.invoke(IPC.TOKENS_GET_STATS),
+  resetTokenStats: () => ipcRenderer.invoke(IPC.TOKENS_RESET),
   getAiDiagnosticsSnapshot: () => ipcRenderer.invoke(IPC.AI_DIAGNOSTICS_SNAPSHOT),
 
   // Export
