@@ -16,6 +16,7 @@ import { LocalDocumentPreviewModal } from '../components/local-document-preview-
 import { BronPageEmbedModal } from '../components/bron-page-embed'
 import { useAiActivityPanelStore } from '../stores/ai-activity-panel-store'
 import { useAnalysisActiveStore } from '../stores/analysis-active-store'
+import { useThemeStore } from '../stores/theme-store'
 import { ProcedureOverviewCard } from '../components/procedure-timeline'
 import { RisicoTab } from '../components/RisicoTab'
 import { InschrijvingTab } from '../components/InschrijvingTab'
@@ -441,7 +442,47 @@ function getFileIcon(name: string, docType?: string) {
   return <File className={`${ic} text-[var(--muted-foreground)]`} />
 }
 
+/** Vaste sRGB in lichte modus (Tailwind v4 OKLCH oogt vaak flets/grijsachtig). */
+const RELEVANCE_ROW_LIGHT: Record<
+  string,
+  { bg: string; border: string; label: string; icon: string; pillBg: string; pillBorder: string }
+> = {
+  match: {
+    bg: '#dcfce7',
+    border: '#22c55e',
+    label: '#14532d',
+    icon: '#15803d',
+    pillBg: '#bbf7d0',
+    pillBorder: '#4ade80',
+  },
+  gedeeltelijk: {
+    bg: '#fef08a',
+    border: '#eab308',
+    label: '#713f12',
+    icon: '#a16207',
+    pillBg: '#fde047',
+    pillBorder: '#ca8a04',
+  },
+  niet_aanwezig: {
+    bg: '#e2e8f0',
+    border: '#64748b',
+    label: '#1e293b',
+    icon: '#475569',
+    pillBg: '#f1f5f9',
+    pillBorder: '#94a3b8',
+  },
+  risico: {
+    bg: '#fecaca',
+    border: '#ef4444',
+    label: '#7f1d1d',
+    icon: '#b91c1c',
+    pillBg: '#fca5a5',
+    pillBorder: '#dc2626',
+  },
+}
+
 export function TenderDetailPage() {
+  const isDark = useThemeStore((s) => s.dark)
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
@@ -1479,9 +1520,18 @@ export function TenderDetailPage() {
                       }
                       const config = statusConfig[status] || statusConfig.niet_aanwezig
                       const Icon = config.icon
+                      const lightUi = RELEVANCE_ROW_LIGHT[status] ?? RELEVANCE_ROW_LIGHT.niet_aanwezig
 
                       return (
-                        <div key={key} className={`rounded-lg border ${config.borderColor} ${config.bgColor} transition-all`}>
+                        <div
+                          key={key}
+                          className={`rounded-lg border transition-colors ${isDark ? `${config.borderColor} ${config.bgColor}` : ''}`}
+                          style={
+                            !isDark
+                              ? { backgroundColor: lightUi.bg, borderColor: lightUi.border }
+                              : undefined
+                          }
+                        >
                           <button
                             onClick={() => {
                               if (!hasDetails) return
@@ -1492,16 +1542,41 @@ export function TenderDetailPage() {
                                 return next
                               })
                             }}
-                            className={`flex items-center gap-3 w-full px-3 py-2.5 text-left ${hasDetails ? 'cursor-pointer hover:opacity-80' : 'cursor-default'} transition-opacity`}
+                            className={`flex items-center gap-3 w-full px-3 py-2.5 text-left ${
+                              hasDetails
+                                ? 'cursor-pointer hover:bg-black/[0.06] dark:hover:bg-white/5'
+                                : 'cursor-default'
+                            } transition-colors`}
                           >
-                            <Icon className={`h-5 w-5 flex-shrink-0 ${config.color}`} />
+                            <Icon
+                              className={`h-5 w-5 flex-shrink-0 ${isDark ? config.color : ''}`}
+                              style={!isDark ? { color: lightUi.icon } : undefined}
+                            />
                             <div className="flex-1 min-w-0">
                               <div className="flex items-center justify-between gap-2">
                                 <span className="text-sm font-medium text-[var(--foreground)] truncate">{criteriumLabel}</span>
                                 <div className="flex items-center gap-2 flex-shrink-0">
-                                  <span className={`text-xs font-semibold ${config.color}`}>{config.label}</span>
+                                  <span
+                                    className={`text-xs font-semibold ${isDark ? config.color : ''}`}
+                                    style={!isDark ? { color: lightUi.label } : undefined}
+                                  >
+                                    {config.label}
+                                  </span>
                                   {score !== 0 && (
-                                    <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded-full ${config.bgColor} ${config.color} border ${config.borderColor}`}>
+                                    <span
+                                      className={`text-[10px] font-medium px-1.5 py-0.5 rounded-full border ${
+                                        isDark ? `${config.bgColor} ${config.color} ${config.borderColor}` : ''
+                                      }`}
+                                      style={
+                                        !isDark
+                                          ? {
+                                              backgroundColor: lightUi.pillBg,
+                                              borderColor: lightUi.pillBorder,
+                                              color: lightUi.label,
+                                            }
+                                          : undefined
+                                      }
+                                    >
                                       {Math.round(score)}
                                     </span>
                                   )}

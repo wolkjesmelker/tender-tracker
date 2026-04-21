@@ -10,6 +10,7 @@ import {
 } from 'lucide-react'
 import { DeleteConfirmationModal } from '../components/delete-confirmation-modal'
 import { useAnalysisActiveStore } from '../stores/analysis-active-store'
+import { useThemeStore } from '../stores/theme-store'
 
 type TenderSortOrder = 'created_desc' | 'deadline_asc' | 'score_desc'
 
@@ -58,6 +59,7 @@ function getCountryFlag(naam?: string, url?: string): string {
 }
 
 export function TendersPage() {
+  const isDark = useThemeStore((s) => s.dark)
   const [searchParams, setSearchParams] = useSearchParams()
   /** Na `?filter=…` uit de URL te hebben gelezen en de URL te wissen, blijft dit de actieve KPI-filter voor de API (anders verliest `urgentOnly` / `createdToday` direct weer). */
   const [dashboardKpiFilter, setDashboardKpiFilter] = useState<string | null>(null)
@@ -758,11 +760,18 @@ export function TendersPage() {
                         <span
                           title={hasAiAnalyse ? `AI-analyse uitgevoerd — score ${Math.round(tender.totaal_score)}` : 'Nog geen AI-analyse uitgevoerd'}
                           className={[
-                            'inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[9px] font-semibold',
+                            'inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[9px] font-semibold',
                             hasAiAnalyse
-                              ? 'bg-violet-100 text-gray-900 dark:bg-violet-950/50 dark:text-violet-300'
-                              : 'bg-[var(--muted)] text-[var(--muted-foreground)]/50',
+                              ? isDark
+                                ? 'border-transparent bg-violet-950/50 text-violet-300'
+                                : ''
+                              : 'border-transparent bg-[var(--muted)] text-[var(--muted-foreground)]/50',
                           ].join(' ')}
+                          style={
+                            hasAiAnalyse && !isDark
+                              ? { backgroundColor: '#ede9fe', color: '#5b21b6', borderColor: '#8b5cf6' }
+                              : undefined
+                          }
                         >
                           <Brain className="h-2.5 w-2.5" />
                           AI
@@ -770,11 +779,18 @@ export function TendersPage() {
                         <span
                           title={hasRisicoAnalyse ? 'Risico-analyse uitgevoerd' : 'Nog geen risico-analyse uitgevoerd'}
                           className={[
-                            'inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[9px] font-semibold',
+                            'inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[9px] font-semibold',
                             hasRisicoAnalyse
-                              ? 'bg-orange-100 text-gray-900 dark:bg-orange-950/50 dark:text-orange-300'
-                              : 'bg-[var(--muted)] text-[var(--muted-foreground)]/50',
+                              ? isDark
+                                ? 'border-transparent bg-orange-950/50 text-orange-300'
+                                : ''
+                              : 'border-transparent bg-[var(--muted)] text-[var(--muted-foreground)]/50',
                           ].join(' ')}
+                          style={
+                            hasRisicoAnalyse && !isDark
+                              ? { backgroundColor: '#ffedd5', color: '#9a3412', borderColor: '#fb923c' }
+                              : undefined
+                          }
                         >
                           <ShieldAlert className="h-2.5 w-2.5" />
                           Risico

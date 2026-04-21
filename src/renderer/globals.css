@@ -9,6 +9,11 @@
 }
 
 @layer base {
+  /* Voorkomt dat de browser lichte UI "dimt" / grijsachtig rendert (form controls, scrollbars). */
+  :root {
+    color-scheme: light;
+  }
+
   :root {
     --background: oklch(1 0 0);
     --foreground: oklch(0 0 0);
@@ -47,6 +52,7 @@
 
   /* ── Dark mode ── */
   .dark {
+    color-scheme: dark;
     --background: oklch(0.13 0.015 240);
     --foreground: oklch(0.93 0.01 240);
     --card: oklch(0.17 0.018 240);

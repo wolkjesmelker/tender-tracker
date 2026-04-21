@@ -12,6 +12,11 @@ function applyTheme(dark: boolean): void {
     document.documentElement.classList.remove('dark')
   }
   try {
+    document.documentElement.style.colorScheme = dark ? 'dark' : 'light'
+  } catch {
+    /* ignore */
+  }
+  try {
     localStorage.setItem(STORAGE_KEY, dark ? '1' : '0')
   } catch {
     /* ignore */
