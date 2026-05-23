@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, shell, protocol } from 'electron'
+import { app, BrowserWindow, ipcMain, shell, protocol, powerMonitor, dialog } from 'electron'
 import path from 'path'
 import fs from 'fs'
 
@@ -6,15 +6,24 @@ import fs from 'fs'
 // waardoor browser-gebaseerde tracking (Mercell, België, documenten) lijkt te “hangen”.
 app.commandLine.appendSwitch('disable-renderer-backgrounding')
 app.commandLine.appendSwitch('disable-background-timer-throttling')
+// Voorkomt throttling door vensters die achter andere vensters liggen (niet alleen focus).
+app.commandLine.appendSwitch('disable-backgrounding-occluded-windows')
+import { keepWebContentsActiveForBackgroundWork } from './utils/keep-webcontents-active'
+import { ensureUnifiedUserDataPath } from './user-data-path'
+import { ensureAppStorageDirectories } from './utils/paths'
 import { initDatabase } from './db/connection'
 import { registerAllHandlers } from './ipc'
 import { restoreAuthStateOnStartup } from './ipc/auth.ipc'
+import { startAutoSync } from './ipc/sync.ipc'
 import { setStartupLicenseStatus } from './ipc/app.ipc'
 import { verifyLicenseSeat } from './license/license-service'
 import { initScheduler } from './scheduler/scheduler'
 import { initCloudBackupScheduler } from './backup/backup-scheduler'
+import { initLocalDataBackupScheduler, scheduleStartupLocalBackupIfNeeded } from './backup/local-data-backup'
 import { setupAutoUpdater } from './updater'
 import log from 'electron-log'
+import { registerOngoingWorkQuitGuard, resetOngoingWorkQuitBypass } from './utils/ongoing-work-quit-guard'
+import { loadSupabaseRuntimeEnv } from './config/supabase-runtime-env'
 
 // Custom protocol for serving local tender documents in iframes (avoids data: URI size limits)
 // Must be registered before app is ready.
@@ -38,7 +47,16 @@ log.transports.console.level = 'debug'
 const gotLock = app.requestSingleInstanceLock()
 if (!gotLock) {
   log.info('Another instance is already running - quitting this one')
+  // showErrorBox werkt vóór app.ready — helpt als gebruikers denken dat de app “niet opent”.
+  dialog.showErrorBox(
+    'TenderTracker is al gestart',
+    'Sluit het andere venster of stop TenderTracker in Activiteitweergave (Activity Monitor) en probeer opnieuw.',
+  )
   app.quit()
+} else {
+  // Vóór database-init: één vaste Application Support-map + herstel rijkste DB bij DMG-installatie.
+  ensureUnifiedUserDataPath()
+  ensureAppStorageDirectories()
 }
 
 app.on('second-instance', () => {
@@ -59,6 +77,7 @@ let mainWindow: BrowserWindow | null = null
 let appShellIpcRegistered = false
 
 function createWindow() {
+  resetOngoingWorkQuitBypass()
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -79,6 +98,8 @@ function createWindow() {
     show: false,
   })
 
+  keepWebContentsActiveForBackgroundWork(mainWindow)
+
   mainWindow.once('ready-to-show', () => {
     mainWindow?.show()
   })
@@ -93,6 +114,8 @@ function createWindow() {
   mainWindow.on('closed', () => {
     mainWindow = null
   })
+
+  registerOngoingWorkQuitGuard(() => mainWindow)
 }
 
 function registerAppShellIpcOnce(): void {
@@ -112,6 +135,9 @@ function registerAppShellIpcOnce(): void {
 
 app.whenReady().then(async () => {
   log.info('TenderTracker starting...')
+
+  // DMG/Release hebben vaak lege Vite-`define`; lees .env-achtig materiaal vóór DB/sync.
+  loadSupabaseRuntimeEnv()
 
   // Serve local tender documents via tender-file://local/{tenderId}/{fileName}
   // Serve bron preview cache via tender-file://bron-cache/{fileName}
@@ -192,6 +218,8 @@ app.whenReady().then(async () => {
   initDatabase()
   log.info('Database initialized')
 
+  scheduleStartupLocalBackupIfNeeded()
+
   // Register IPC handlers
   registerAllHandlers()
   registerAppShellIpcOnce()
@@ -199,6 +227,10 @@ app.whenReady().then(async () => {
 
   await restoreAuthStateOnStartup()
   log.info('Auth-sessies (TenderNed / Mercell / België) hersteld vanaf schijf')
+
+  // Start automatische achtergrond-sync met Supabase (anon-key, geen login nodig)
+  startAutoSync()
+  log.info('[supabase] Achtergrond-sync gestart')
 
   const licenseStatus = await verifyLicenseSeat()
   setStartupLicenseStatus(licenseStatus)
@@ -217,6 +249,15 @@ app.whenReady().then(async () => {
 
   initCloudBackupScheduler()
   log.info('Cloud backup scheduler initialized')
+
+  initLocalDataBackupScheduler()
+  log.info('Local data backup scheduler initialized')
+
+  powerMonitor.on('resume', () => {
+    log.info(
+      '[scheduler] Systeem hervat uit slaap/stand-by — volgende geplande tracking volgens cron (geen automatische inhaalrun).',
+    )
+  })
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

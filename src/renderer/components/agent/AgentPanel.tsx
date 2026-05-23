@@ -1,10 +1,23 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
-import { Bot, X, Send, Eraser, Search, FileText, Minimize2, Maximize2, ChevronsDown } from 'lucide-react'
+import {
+  Bot,
+  X,
+  Send,
+  Eraser,
+  Search,
+  FileText,
+  Minimize2,
+  Maximize2,
+  ChevronsDown,
+  Trash2,
+} from 'lucide-react'
+import { classifyWebSearchResultKind } from '@shared/web-search-classify'
 import { api, isElectron } from '../../lib/ipc-client'
 import { useAgentStore, historyToChatMessages, type AgentChatMessage } from '../../stores/agent-store'
 import type { AgentMessage, AgentWebSearchResult } from '@shared/types'
 import { cn } from '../../lib/utils'
+import { FEATURE_DOCUMENT_FORM_FILL } from '../../../shared/feature-flags'
 
 function tenderIdFromPath(pathname: string): string | null {
   const m = pathname.match(/\/aanbestedingen\/([^/]+)/)
@@ -45,6 +58,7 @@ export function AgentPanel() {
   const [searchResults, setSearchResults] = useState<AgentWebSearchResult[]>([])
   const [searchOpen, setSearchOpen] = useState(false)
   const [searching, setSearching] = useState(false)
+  const [pinError, setPinError] = useState<string | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
 
   // Sync active tender with route
@@ -170,6 +184,7 @@ export function AgentPanel() {
   const runWebSearch = async () => {
     const q = searchQuery.trim()
     if (!q) return
+    setPinError(null)
     setSearching(true)
     try {
       const res = (await api.agentWebSearch?.({ query: q, count: 6 })) as
@@ -185,14 +200,26 @@ export function AgentPanel() {
     }
   }
 
-  const pinResult = async (r: AgentWebSearchResult) => {
+  const removeSearchResult = (r: AgentWebSearchResult) => {
+    setSearchResults((prev) => prev.filter((x) => x.url !== r.url))
+  }
+
+  const pinResult = async (r: AgentWebSearchResult, kind: 'doc_ref' | 'note') => {
     if (!tenderId) return
-    await api.agentPinSearchResult?.({
+    setPinError(null)
+    const res = (await api.agentPinSearchResult?.({
       tenderId,
       url: r.url,
-      summary: `${r.title} — ${r.snippet}`,
+      title: r.title,
+      snippet: r.snippet,
       query: searchQuery,
-    })
+      kind,
+    })) as { ok?: boolean; error?: string } | null
+    if (res && res.ok === false && res.error) {
+      setPinError(res.error)
+      return
+    }
+    setSearchResults((prev) => prev.filter((x) => x.url !== r.url))
   }
 
   const hasTenderContext = !!tenderId
@@ -268,13 +295,13 @@ export function AgentPanel() {
         <>
           <div className="flex gap-1 overflow-x-auto border-b border-[var(--border)] px-2 py-1 text-[11px]">
             <button
-              className="rounded bg-[var(--muted)] px-2 py-1 hover:bg-blue-50"
+              className="rounded bg-[var(--muted)] px-2 py-1 text-[var(--foreground)] hover:bg-blue-50 dark:hover:bg-[var(--accent)]"
               onClick={() => quickAction(hasTenderContext ? 'Toon deadlines en bedragen voor deze aanbesteding.' : 'Welke aanbestedingen hebben deze week een deadline?')}
             >
               Deadlines & bedragen
             </button>
             <button
-              className="rounded bg-[var(--muted)] px-2 py-1 hover:bg-blue-50"
+              className="rounded bg-[var(--muted)] px-2 py-1 text-[var(--foreground)] hover:bg-blue-50 dark:hover:bg-[var(--accent)]"
               onClick={() =>
                 quickAction(
                   hasTenderContext
@@ -285,14 +312,22 @@ export function AgentPanel() {
             >
               Risico's
             </button>
+            {FEATURE_DOCUMENT_FORM_FILL ? (
+              <button
+                className="rounded bg-[var(--muted)] px-2 py-1 text-[var(--foreground)] hover:bg-blue-50 dark:hover:bg-[var(--accent)]"
+                onClick={() =>
+                  quickAction(
+                    hasTenderContext
+                      ? 'Welke documenten zijn nog niet ingevuld?'
+                      : 'Welke tender heeft de meeste openstaande velden?',
+                  )
+                }
+              >
+                Invulstatus
+              </button>
+            ) : null}
             <button
-              className="rounded bg-[var(--muted)] px-2 py-1 hover:bg-blue-50"
-              onClick={() => quickAction(hasTenderContext ? 'Welke documenten zijn nog niet ingevuld?' : 'Welke tender heeft de meeste openstaande velden?')}
-            >
-              Invulstatus
-            </button>
-            <button
-              className="rounded bg-[var(--muted)] px-2 py-1 hover:bg-blue-50"
+              className="rounded bg-[var(--muted)] px-2 py-1 text-[var(--foreground)] hover:bg-blue-50 dark:hover:bg-[var(--accent)]"
               onClick={() => setSearchOpen((v) => !v)}
               title="Open internet-zoekopdracht"
             >
@@ -300,7 +335,7 @@ export function AgentPanel() {
             </button>
             {!hasTenderContext && (
               <button
-                className="rounded bg-[var(--muted)] px-2 py-1 hover:bg-blue-50"
+                className="rounded bg-[var(--muted)] px-2 py-1 text-[var(--foreground)] hover:bg-blue-50 dark:hover:bg-[var(--accent)]"
                 onClick={openTenderIfNone}
               >
                 <FileText className="inline h-3 w-3 mr-1" /> Kies tender
@@ -329,29 +364,60 @@ export function AgentPanel() {
                   {searching ? '…' : 'Zoek'}
                 </button>
               </div>
+              {pinError && (
+                <p className="mt-1 text-[10px] text-red-700" role="alert">
+                  {pinError}
+                </p>
+              )}
               {searchResults.length > 0 && (
-                <div className="mt-2 space-y-1 max-h-40 overflow-y-auto">
-                  {searchResults.map((r) => (
+                <div className="mt-2 space-y-1 max-h-40 overflow-y-auto pr-0.5">
+                  {searchResults.map((r) => {
+                    const suggested = classifyWebSearchResultKind(r.url)
+                    return (
                     <div key={r.url} className="rounded border border-[var(--border)] bg-[var(--background)] p-2 text-[11px]">
                       <a href={r.url} target="_blank" rel="noreferrer" className="font-semibold text-blue-700 hover:underline line-clamp-1">
                         {r.title || r.url}
                       </a>
                       <div className="text-[var(--muted-foreground)] line-clamp-2">{r.snippet}</div>
-                      <div className="mt-1 flex items-center gap-2">
+                      <div className="mt-0.5 text-[9px] text-[var(--muted-foreground)]">
+                        Automatische indeling: {suggested === 'doc_ref' ? 'document' : 'webpagina (aantekening)'}
+                      </div>
+                      <div className="mt-1 flex flex-wrap items-center gap-1.5">
                         <a href={r.url} target="_blank" rel="noreferrer" className="text-blue-600 hover:underline text-[10px]">
                           Open
                         </a>
                         {hasTenderContext && (
-                          <button
-                            className="rounded bg-green-50 px-1.5 py-0.5 text-[10px] text-green-800 hover:bg-green-100"
-                            onClick={() => void pinResult(r)}
-                          >
-                            Toevoegen aan dossier
-                          </button>
+                          <>
+                            <button
+                              type="button"
+                              className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] text-emerald-900 hover:bg-emerald-100 border border-emerald-200/80"
+                              onClick={() => void pinResult(r, 'doc_ref')}
+                              title="Koppelt bron als document + slaat tekstexport op (handmatige opzoekactie)"
+                            >
+                              Document
+                            </button>
+                            <button
+                              type="button"
+                              className="rounded bg-green-50 px-1.5 py-0.5 text-[10px] text-green-800 hover:bg-green-100"
+                              onClick={() => void pinResult(r, 'note')}
+                              title="Alleen aantekening + tekstexport (handmatige opzoekactie)"
+                            >
+                              Aantekening
+                            </button>
+                          </>
                         )}
+                        <button
+                          type="button"
+                          className="ml-auto rounded p-0.5 text-[var(--muted-foreground)] hover:bg-red-50 hover:text-red-700"
+                          onClick={() => removeSearchResult(r)}
+                          title="Uit lijst halen (nog niet in dossier)"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
                       </div>
                     </div>
-                  ))}
+                    )
+                  })}
                 </div>
               )}
             </div>
@@ -363,7 +429,9 @@ export function AgentPanel() {
                 <Bot className="mx-auto mb-2 h-6 w-6 opacity-50" />
                 <div>
                   {hasTenderContext
-                    ? 'Stel een vraag over deze aanbesteding, vraag om een document samen in te vullen, of laat de agent iets opzoeken.'
+                    ? FEATURE_DOCUMENT_FORM_FILL
+                      ? 'Stel een vraag over deze aanbesteding, vraag om een document samen in te vullen, of laat de agent iets opzoeken.'
+                      : 'Stel een vraag over deze aanbesteding of laat de agent iets opzoeken.'
                     : 'Geen tender geselecteerd. Vraag iets globaal, of kies eerst een aanbesteding.'}
                 </div>
               </div>

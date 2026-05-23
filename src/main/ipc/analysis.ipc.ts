@@ -1,8 +1,10 @@
 import { ipcMain } from 'electron'
 import { getDb } from '../db/connection'
+import { requestDebouncedCloudPush } from '../db/supabase-sync'
 import { IPC } from '../../shared/constants'
 import {
   runAnalysis,
+  runIncrementalAnalysisForManualDocuments,
   isAnalysisPaused,
   isAnalysisStopped,
 } from '../ai/analysis-pipeline'
@@ -22,6 +24,8 @@ import { broadcastAnalysisProgress, replayAnalysisUiToWebContents } from './anal
 import { setSingleAnalysisRunState, setBatchAnalysisRunState } from './analysis-run-state'
 import log from 'electron-log'
 import type { AnalysisResult, AiExtractedTenderFields } from '../../shared/types'
+import { tenderHasRisicoInventarisatie } from './risico.ipc'
+import { ensurePreAnalyzeFillableDocuments } from '../ai/document-fill-engine'
 
 /** Vul alleen lege kolommen vanuit AI-velden (bron blijft leidend). */
 function mergeAiExtractedIntoColumns(aanbestedingId: string, velden: AiExtractedTenderFields | undefined): void {
@@ -76,6 +80,7 @@ function persistAnalysisResult(aanbestedingId: string, result: AnalysisResult): 
     aanbestedingId
   )
   mergeAiExtractedIntoColumns(aanbestedingId, result.tender_velden)
+  requestDebouncedCloudPush()
 }
 
 // Track running batch analysis in main process (persists across page navigations)
@@ -113,6 +118,9 @@ let pendingSingleAnalysisIds: string[] = []
 
 /** Voorkomt dat meerdere `kickBackgroundQueues`-aanroepen tegelijk de wachtrij verwerken. */
 let backgroundQueueProcessorRunning = false
+
+/** Handmatig toegevoegde documenten: alleen nieuwe bestanden analyseren (criteria + bijlage + samenvatting-merge). */
+const pendingIncrementalByTender = new Map<string, Set<string>>()
 
 function mergePostScrapePendingIds(ids: string[]): void {
   const seen = new Set(pendingPostScrapeIds)
@@ -201,6 +209,102 @@ function kickBackgroundQueues(): void {
   void processBackgroundAnalysisQueues().catch((e) => log.error('[analysis] Achtergrond-wachtrij:', e))
 }
 
+function shiftPendingIncrementalJob(): { id: string; names: string[] } | null {
+  const firstKey = pendingIncrementalByTender.keys().next().value as string | undefined
+  if (!firstKey) return null
+  const set = pendingIncrementalByTender.get(firstKey)!
+  pendingIncrementalByTender.delete(firstKey)
+  return { id: firstKey, names: [...set] }
+}
+
+/**
+ * Na handmatig document(en) toevoegen: incrementele AI-update (geen volledige bron/her-analyse).
+ * Wacht automatisch tot geen batch/losse analyse bezig is; meerdere uploads voor dezelfde tender worden samengevoegd.
+ */
+export function enqueueIncrementalManualDocumentAnalysis(aanbestedingId: string, localNames: string[]): void {
+  const id = String(aanbestedingId || '').trim()
+  const names = localNames.map((n) => String(n || '').trim()).filter(Boolean)
+  if (!id || !names.length) return
+  let set = pendingIncrementalByTender.get(id)
+  if (!set) {
+    set = new Set()
+    pendingIncrementalByTender.set(id, set)
+  }
+  for (const n of names) set.add(n)
+  log.info(
+    `[analysis] Aanvullende analyse gepland voor ${id} (${names.join(', ')}); ` +
+      `${pendingIncrementalByTender.size} tender(s) in incrementele wachtrij`,
+  )
+  kickBackgroundQueues()
+}
+
+async function runIncrementalManualDocumentsWork(aanbestedingId: string, newLocalNames: string[]): Promise<void> {
+  const db = getDb()
+  const tender = db.prepare('SELECT * FROM aanbestedingen WHERE id = ?').get(aanbestedingId) as any
+  if (!tender) {
+    log.warn(`[analysis] Incrementele analyse: aanbesteding ${aanbestedingId} niet gevonden`)
+    return
+  }
+
+  if (!tenderHasStoredAiScore(tender)) {
+    log.info(
+      `[analysis] Geen geldige bestaande AI-score voor ${aanbestedingId} — volledige analyse i.p.v. incrementeel`,
+    )
+    if (singleAnalysisRunning || batchState.running) {
+      const dupIdx = pendingSingleAnalysisIds.indexOf(aanbestedingId)
+      if (dupIdx < 0) pendingSingleAnalysisIds.push(aanbestedingId)
+    } else {
+      await runSingleAnalysisWork(aanbestedingId, false).catch((err) =>
+        log.error('[analysis] Volledige analyse na upload mislukt:', err),
+      )
+    }
+    return
+  }
+
+  const criteria = db.prepare('SELECT * FROM criteria WHERE is_actief = 1 ORDER BY volgorde').all() as any[]
+  const settings = db.prepare('SELECT key, value FROM app_settings').all() as { key: string; value: string }[]
+  const settingsMap: Record<string, string> = {}
+  settings.forEach((s) => {
+    settingsMap[s.key] = s.value
+  })
+  const prompts = db.prepare('SELECT * FROM ai_prompts WHERE is_actief = 1').all() as any[]
+
+  analysisControlBegin(aanbestedingId)
+  singleAnalysisRunning = true
+  singleAnalysisAanbestedingId = aanbestedingId
+  setSingleAnalysisRunState(true, aanbestedingId)
+  let magWachtrijVoortzetten = true
+  try {
+    const result = await runIncrementalAnalysisForManualDocuments(
+      tender,
+      newLocalNames,
+      criteria,
+      prompts,
+      settingsMap,
+      (progress) => {
+        broadcastAnalysisProgress({ aanbestedingId, ...progress })
+      },
+    )
+    persistAnalysisResult(aanbestedingId, result)
+    log.info(`[analysis] Aanvullende analyse opgeslagen voor ${aanbestedingId} (totaal_score=${result.totaal_score})`)
+  } catch (error: any) {
+    log.error('[analysis] Aanvullende analyse (handmatige bijlage) mislukt:', error)
+    broadcastAnalysisProgress({
+      aanbestedingId,
+      step: error?.message ? `Aanvullende analyse mislukt: ${error.message}` : 'Aanvullende analyse mislukt.',
+      percentage: 0,
+    })
+  } finally {
+    analysisControlReset()
+    singleAnalysisRunning = false
+    singleAnalysisAanbestedingId = null
+    setSingleAnalysisRunState(false, null)
+    if (magWachtrijVoortzetten) {
+      kickBackgroundQueues()
+    }
+  }
+}
+
 /**
  * Wachtrij: eerst alle losse detail-analyses (elk: AI-analyse + risico), daarna post-scrape-ID’s als batch
  * (per item hetzelfde). Loopt door tot er niets meer wacht of er weer een actieve run is.
@@ -211,6 +315,14 @@ async function processBackgroundAnalysisQueues(): Promise<void> {
   try {
     for (;;) {
       if (singleAnalysisRunning || batchState.running) return
+
+      const inc = shiftPendingIncrementalJob()
+      if (inc) {
+        await runIncrementalManualDocumentsWork(inc.id, inc.names).catch((err) =>
+          log.error('[analysis] Incrementele wachtrij-job mislukt:', err),
+        )
+        continue
+      }
 
       const nextSingle = pendingSingleAnalysisIds.shift()
       if (nextSingle) {
@@ -246,17 +358,15 @@ async function processBackgroundAnalysisQueues(): Promise<void> {
  */
 async function persistAndRunRisico(aanbestedingId: string, result: AnalysisResult): Promise<void> {
   persistAnalysisResult(aanbestedingId, result)
-  try {
-    const db = getDb()
-    const row = db.prepare('SELECT risico_analyse FROM aanbestedingen WHERE id = ?').get(aanbestedingId) as
-      | { risico_analyse?: string | null }
-      | undefined
-    if (row?.risico_analyse) {
-      log.info(`[analysis] Auto-risico overgeslagen — bestaande analyse aanwezig voor ${aanbestedingId}`)
-      return
-    }
-  } catch {
-    // DB-check mislukt — verloopt door en voert risico alsnog uit
+
+  if (tenderHasRisicoInventarisatie(aanbestedingId)) {
+    log.info(`[analysis] Auto-risico overgeslagen — bestaande inventarisatie voor ${aanbestedingId}`)
+    // Zelfs zonder nieuwe risico-run willen we de invulvelden + checklist vers
+    // hebben voor de agent- en invul-wizard. preAnalyzeFillableDocuments is
+    // idempotent: documenten met gecachete velden én checklist worden
+    // overgeslagen.
+    await ensurePreAnalyzeFillableDocuments(aanbestedingId)
+    return
   }
   try {
     const { runRisicoAfterMainAnalysis } = await import('./risico.ipc')
@@ -267,6 +377,11 @@ async function persistAndRunRisico(aanbestedingId: string, result: AnalysisResul
   } catch (e: unknown) {
     log.error('[analysis] Risico na hoofdanalyse mislukt:', e)
   }
+
+  // Belt-and-braces: `runRisicoAfterMainAnalysis` draait zelf ook de
+  // veld-pre-analyse, maar als die stap om welke reden dan ook niet is
+  // uitgevoerd (bv. fout halverwege) zorgen we hier voor een finale poging.
+  await ensurePreAnalyzeFillableDocuments(aanbestedingId)
 }
 
 async function runSingleAnalysisWork(

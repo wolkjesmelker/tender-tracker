@@ -4,6 +4,7 @@ import path from 'path'
 import fs from 'fs'
 import log from 'electron-log'
 import {
+  APP_SETTING_POST_SCRAPE_ANALYZE_IMMEDIATELY,
   APP_SETTING_RISICO_PROMPT_EXTRACTIE,
   APP_SETTING_RISICO_PROMPT_HOOFD,
   DEFAULT_SEARCH_TERMS,
@@ -28,6 +29,54 @@ export function getDb(): Database.Database {
     throw new Error('Database not initialized. Call initDatabase() first.')
   }
   return db
+}
+
+/** Tabellen waarvoor cloud-sync een updated_at-kolom verwacht (SQLite). */
+const SYNC_TABLES_NEEDING_UPDATED_AT = [
+  'zoektermen',
+  'criteria',
+  'ai_vragen',
+  'ai_prompts',
+  'scrape_jobs',
+  'scrape_schema',
+  'agent_conversations',
+  'agent_pinned_notes',
+  'agent_learning_entries',
+] as const
+
+/**
+ * Elke app-start: ontbrekende updated_at toevoegen. Herstelt DB's waar v23/v24/v25
+ * de kolom niet heeft maar schema_version wel is opgehoogd.
+ *
+ * Kritiek: SQLite ALTER TABLE ADD COLUMN verbiedt DEFAULT (expr) - ook datetime('now').
+ * Gebruik een constante string-literal; anders mislukt de ALTER silently.
+ */
+function repairSyncTablesUpdatedAt(database: Database.Database): void {
+  for (const t of SYNC_TABLES_NEEDING_UPDATED_AT) {
+    let cols: { name: string }[]
+    try {
+      cols = database.prepare(`PRAGMA table_info(${t})`).all() as { name: string }[]
+    } catch {
+      continue
+    }
+    if (cols.length === 0) continue
+    const names = new Set(cols.map((c) => c.name))
+    if (names.has('updated_at')) continue
+    try {
+      database.exec(
+        `ALTER TABLE ${t} ADD COLUMN updated_at TEXT NOT NULL DEFAULT '2000-01-01 00:00:00'`,
+      )
+      log.info(`[db] repairSyncTablesUpdatedAt: updated_at toegevoegd op ${t}`)
+    } catch (e: unknown) {
+      log.warn(`[db] repairSyncTablesUpdatedAt: ALTER NOT NULL mislukt voor ${t}, probeer nullable`, e)
+      try {
+        database.exec(`ALTER TABLE ${t} ADD COLUMN updated_at TEXT DEFAULT '2000-01-01 00:00:00'`)
+        log.info(`[db] repairSyncTablesUpdatedAt: updated_at (nullable) toegevoegd op ${t}`)
+      } catch (e2: unknown) {
+        log.error(`[db] repairSyncTablesUpdatedAt: kon updated_at niet toevoegen op ${t}`, e2)
+      }
+    }
+  }
 }
 
 export function initDatabase(): void {
@@ -372,6 +421,233 @@ function runMigrations(db: Database.Database): void {
     db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(17)
     log.info(`Applied migration v17: kimi-k2.5 → kimi-k2.6 in ai_token_usage (${result.changes} rijen bijgewerkt)`)
   }
+
+  if (version < 18) {
+    try {
+      db.exec(`ALTER TABLE aanbestedingen ADD COLUMN document_catalog_selected_keys TEXT`)
+      log.info('Applied migration v18: document_catalog_selected_keys (JSON-array vinkjes documentenlijst)')
+    } catch (e: unknown) {
+      log.warn('Migration v18: document_catalog_selected_keys may already exist', e)
+    }
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(18)
+    log.info('Applied migration v18 complete')
+  }
+
+  if (version < 19) {
+    try {
+      db.exec(`ALTER TABLE agent_pinned_notes ADD COLUMN entry_kind TEXT NOT NULL DEFAULT 'note'`)
+    } catch (e: unknown) {
+      log.warn('Migration v19: entry_kind may already exist', e)
+    }
+    try {
+      db.exec(`ALTER TABLE agent_pinned_notes ADD COLUMN is_manual_search INTEGER NOT NULL DEFAULT 1`)
+    } catch (e: unknown) {
+      log.warn('Migration v19: is_manual_search may already exist', e)
+    }
+    try {
+      db.exec(`ALTER TABLE agent_pinned_notes ADD COLUMN text_export_filename TEXT`)
+    } catch (e: unknown) {
+      log.warn('Migration v19: text_export_filename may already exist', e)
+    }
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(19)
+    log.info('Applied migration v19: agent_pinned_notes entry_kind + handmatige opzoek-export')
+  }
+
+  if (version < 20) {
+    // Document-fill-velden: substring-bewijs uit brondocument + vlag "door gebruiker aangeraakt"
+    try {
+      db.exec(`ALTER TABLE agent_document_fills ADD COLUMN source_quote TEXT`)
+    } catch (e: unknown) {
+      log.warn('Migration v20: source_quote may already exist', e)
+    }
+    try {
+      db.exec(`ALTER TABLE agent_document_fills ADD COLUMN user_touched INTEGER NOT NULL DEFAULT 0`)
+    } catch (e: unknown) {
+      log.warn('Migration v20: user_touched may already exist', e)
+    }
+
+    // Informatie-checklist per document (te verzamelen door inschrijver)
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS agent_document_checklists (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        tender_id TEXT NOT NULL,
+        document_naam TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        label TEXT NOT NULL,
+        hint TEXT,
+        source_quote TEXT,
+        item_order INTEGER NOT NULL DEFAULT 0,
+        done INTEGER NOT NULL DEFAULT 0,
+        done_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(tender_id, document_naam, item_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_agent_checklists_tender
+        ON agent_document_checklists(tender_id, document_naam);
+    `)
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(20)
+    log.info('Applied migration v20: agent_document_fills.source_quote/user_touched + agent_document_checklists')
+  }
+
+  if (version < 21) {
+    for (const col of [
+      ['map_lat', 'REAL'],
+      ['map_lng', 'REAL'],
+      ['map_geocode_query', 'TEXT'],
+      ['map_geocode_at', 'TEXT'],
+      ['map_country_code', 'TEXT'],
+    ] as const) {
+      try {
+        db.exec(`ALTER TABLE aanbestedingen ADD COLUMN ${col[0]} ${col[1]}`)
+      } catch (e: unknown) {
+        log.warn(`Migration v21: ${col[0]} may already exist`, e)
+      }
+    }
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(21)
+    log.info('Applied migration v21: aanbestedingen.map_lat/map_lng/map_geocode_query/map_geocode_at/map_country_code')
+  }
+
+  if (version < 23) {
+    // Add updated_at to tables that didn't have it yet — needed for sync watermark.
+    for (const t of SYNC_TABLES_NEEDING_UPDATED_AT) {
+      try {
+        db.exec(`ALTER TABLE ${t} ADD COLUMN updated_at TEXT NOT NULL DEFAULT '2000-01-01 00:00:00'`)
+      } catch {
+        /* column may already exist */
+      }
+    }
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(23)
+    log.info('Applied migration v23: updated_at added to sync tables')
+  }
+
+  if (version < 24) {
+    /** Herstel: sommige installs misten updated_at ondanks v23 (stille ALTER-fout). */
+    for (const t of SYNC_TABLES_NEEDING_UPDATED_AT) {
+      const cols = db.prepare(`PRAGMA table_info(${t})`).all() as { name: string }[]
+      const names = new Set(cols.map((c) => c.name))
+      if (!names.has('updated_at')) {
+        try {
+          db.exec(`ALTER TABLE ${t} ADD COLUMN updated_at TEXT NOT NULL DEFAULT '2000-01-01 00:00:00'`)
+          log.info(`Migration v24: updated_at toegevoegd op ${t}`)
+        } catch (e: unknown) {
+          log.warn(`Migration v24: updated_at op ${t} mislukt`, e)
+        }
+      }
+    }
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(24)
+    log.info('Applied migration v24: updated_at repair voor sync-tabellen')
+  }
+
+  if (version < 25) {
+    /**
+     * v23 en v24 gebruikten DEFAULT (datetime('now')) in ALTER TABLE — dat is
+     * verboden in SQLite (expressies in parentheses zijn niet toegestaan).
+     * Hierdoor mislukte de ALTER silently en bleef updated_at ontbreken.
+     * v25 herhaalt de repair met een constante string-literal als default.
+     */
+    for (const t of SYNC_TABLES_NEEDING_UPDATED_AT) {
+      const cols = db.prepare(`PRAGMA table_info(${t})`).all() as { name: string }[]
+      const names = new Set(cols.map((c) => c.name))
+      if (!names.has('updated_at')) {
+        try {
+          db.exec(`ALTER TABLE ${t} ADD COLUMN updated_at TEXT NOT NULL DEFAULT '2000-01-01 00:00:00'`)
+          log.info(`Migration v25: updated_at (constante default) toegevoegd op ${t}`)
+        } catch (e: unknown) {
+          log.warn(`Migration v25: NOT NULL mislukt voor ${t}, probeer nullable`, e)
+          try {
+            db.exec(`ALTER TABLE ${t} ADD COLUMN updated_at TEXT DEFAULT '2000-01-01 00:00:00'`)
+            log.info(`Migration v25: updated_at nullable (constante default) toegevoegd op ${t}`)
+          } catch (e2: unknown) {
+            log.error(`Migration v25: kon updated_at niet toevoegen op ${t}`, e2)
+          }
+        }
+      }
+    }
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(25)
+    log.info('Applied migration v25: updated_at definitieve repair (constante default)')
+  }
+
+  if (version < 26) {
+    const cols = db.prepare('PRAGMA table_info(bron_websites)').all() as { name: string }[]
+    const names = new Set(cols.map((c) => c.name))
+    if (!names.has('login_gebruikersnaam')) {
+      db.exec(`ALTER TABLE bron_websites ADD COLUMN login_gebruikersnaam TEXT`)
+      log.info('Migration v26: login_gebruikersnaam toegevoegd aan bron_websites')
+    }
+    if (!names.has('login_wachtwoord')) {
+      db.exec(`ALTER TABLE bron_websites ADD COLUMN login_wachtwoord TEXT`)
+      log.info('Migration v26: login_wachtwoord toegevoegd aan bron_websites')
+    }
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(26)
+    log.info('Applied migration v26: inloggegevens kolommen aan bron_websites')
+  }
+
+  if (version < 27) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS verwijderde_bron_urls (
+        bron_url TEXT NOT NULL,
+        bron_website_id TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (bron_url, bron_website_id)
+      )
+    `)
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(27)
+    log.info('Applied migration v27: verwijderde_bron_urls blocklist tabel aangemaakt')
+  }
+
+  if (version < 28) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS tender_updates (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+        aanbesteding_id TEXT NOT NULL,
+        titel TEXT NOT NULL,
+        opdrachtgever TEXT,
+        bron_naam TEXT,
+        bron_url TEXT,
+        reden TEXT NOT NULL DEFAULT 'nieuwe_documenten',
+        detected_at TEXT NOT NULL DEFAULT (datetime('now')),
+        is_gelezen INTEGER NOT NULL DEFAULT 0
+      )
+    `)
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(28)
+    log.info('Applied migration v28: tender_updates notificatietabel aangemaakt')
+  }
+
+  if (version < 29) {
+    try {
+      db.exec(`ALTER TABLE tender_updates ADD COLUMN nieuwe_document_namen TEXT`)
+      log.info('Applied migration v29: tender_updates.nieuwe_document_namen (JSON-array)')
+    } catch (e: unknown) {
+      log.warn('Migration v29: nieuwe_document_namen may already exist', e)
+    }
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(29)
+    log.info('Applied migration v29 complete')
+  }
+
+  if (version < 30) {
+    try {
+      db.exec(`ALTER TABLE aanbestedingen ADD COLUMN risico_analyse_v2 TEXT`)
+      log.info('Applied migration v30: risico_analyse_v2 column')
+    } catch (e: unknown) {
+      log.warn('Migration v30: risico_analyse_v2 may already exist', e)
+    }
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(30)
+    log.info('Applied migration v30 complete')
+  }
+
+  if (version < 31) {
+    try {
+      db.exec(`ALTER TABLE aanbestedingen ADD COLUMN risico_analyse_v2_checkpoint TEXT`)
+      log.info('Applied migration v31: risico_analyse_v2_checkpoint column')
+    } catch (e: unknown) {
+      log.warn('Migration v31: risico_analyse_v2_checkpoint may already exist', e)
+    }
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(31)
+    log.info('Applied migration v31 complete')
+  }
+
+  repairSyncTablesUpdatedAt(db)
 }
 
 const migration_v1 = `
@@ -574,6 +850,7 @@ function seedDefaults(db: Database.Database): void {
   const insRisico = db.prepare('INSERT OR IGNORE INTO app_settings (key, value) VALUES (?, ?)')
   insRisico.run(APP_SETTING_RISICO_PROMPT_HOOFD, DEFAULT_RISICO_HOOFD_PROMPT)
   insRisico.run(APP_SETTING_RISICO_PROMPT_EXTRACTIE, DEFAULT_RISICO_EXTRACTIE_PROMPT)
+  insRisico.run(APP_SETTING_POST_SCRAPE_ANALYZE_IMMEDIATELY, '1')
 }
 
 const DEFAULT_AGENT_PROMPT = `Je bent een senior aanbestedingsanalist en strategic procurement specialist (Nederlandse markt: TenderNed, Mercell, EU-procedures). Je werkt voor een civieltechnisch aannemingsbedrijf en leest documenten zoals een ervaren tendermanager: systematisch, diep, en zonder relevante scope over het hoofd te zien.

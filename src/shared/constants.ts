@@ -9,6 +9,10 @@ export const IPC = {
   TENDERS_STATS: 'tenders:stats',
   TENDERS_DISCOVER_DOCUMENTS: 'tenders:discover-documents',
   TENDERS_NORMALIZE_ON_OPEN: 'tenders:normalize-on-open',
+  /** Kies bestand(en) op schijf, kopieer naar interne tender-opslag, append aan document_urls */
+  TENDERS_ADD_MANUAL_DOCUMENTS: 'tenders:add-manual-documents',
+  /** Verwijder documenten / bron-bestandslinks op basis van catalogus-sleutels (u:/l:/n:/b:). */
+  TENDERS_REMOVE_CATALOG_ENTRIES: 'tenders:remove-catalog-entries',
   DOCUMENTS_DISCOVER_PROGRESS: 'documents:discover-progress',
   TENDERS_LOCAL_DOC_READ: 'tenders:local-doc-read',
   TENDERS_LOCAL_DOC_SAVE_AS: 'tenders:local-doc-save-as',
@@ -18,6 +22,16 @@ export const IPC = {
   TENDERS_BRON_DOC_OPEN_EXTERNAL: 'tenders:bron-doc-open-external',
   /** Cookie-partitie (persist:auth-*) voor webview bij formulieren op de bron */
   TENDERS_BRON_EMBED_PARTITION: 'tenders:bron-embed-partition',
+  /** Bepaal map_lat/map_lng voor één of meer tender-id's (lazy geocoding via Nominatim). */
+  /** Verwerk een handmatig ingevoerde URL als aanbesteding (aanmaken + documenten + analyse). */
+  TENDERS_PROCESS_URL: 'tenders:process-url',
+  /** Voortgang van handmatige URL-verwerking (push vanuit main naar renderer). */
+  TENDERS_PROCESS_URL_PROGRESS: 'tenders:process-url-progress',
+  TENDERS_RESOLVE_MAP_GEOCODES: 'tenders:resolve-map-geocodes',
+  /** Voortgangsupdates van geocoding-queue (renderer → mooie loader). */
+  TENDERS_RESOLVE_MAP_GEOCODES_PROGRESS: 'tenders:resolve-map-geocodes-progress',
+  /** Geocodeer een vrij adres-string (voor bijv. bedrijfsprofielen) via main-process Nominatim. */
+  GEOCODE_ADDRESS: 'geocode:address',
 
   // Sources
   SOURCES_LIST: 'sources:list',
@@ -85,9 +99,21 @@ export const IPC = {
 
   // Risico Inventarisatie
   RISICO_START: 'risico:start',
+  /** Heranalyse met expliciet gekozen top-tier OpenAI model (eenmalige override). */
+  RISICO_START_WITH_MODEL: 'risico:start-with-model',
+  /** Agentic 19-agents pipeline — slaat resultaat op in risico_analyse_v2. */
+  RISICO_START_V2: 'risico:start-v2',
   RISICO_PROGRESS: 'risico:progress',
   /** Renderer vraagt replay van buffer + live run na mount (na subscribe op progress). */
   RISICO_UI_REPLAY: 'risico:ui-replay',
+  /** Push van assembledDraft na elke stage-overgang (progressieve UI). */
+  RISICO_DRAFT_SNAPSHOT: 'risico:draft-snapshot',
+  /** Renderer haalt laatste checkpoint-draft op bij mount (als run al loopt). */
+  RISICO_FETCH_CHECKPOINT_DRAFT: 'risico:fetch-checkpoint-draft',
+  /** Sla de risico-inventarisatie op als zelfstandig HTML-bestand. */
+  RISICO_SAVE_HTML: 'risico:save-html',
+  /** Zelfde opmaak als HTML-export, als PDF via Chromium (geen systeemprintdialoog). */
+  RISICO_SAVE_PDF: 'risico:save-pdf',
 
   // Token statistieken
   TOKENS_GET_STATS: 'tokens:get-stats',
@@ -98,11 +124,23 @@ export const IPC = {
 
   // Export
   EXPORT_GENERATE: 'export:generate',
+  /** Korte tendernota (Word/PDF) vanuit samenvatting-popup */
+  EXPORT_TENDER_SUMMARY: 'export:tender-summary',
 
   // Cloud back-up / synchronisatie (map zoals OneDrive / Google Drive)
   BACKUP_SELECT_CLOUD_FOLDER: 'backup:select-cloud-folder',
   BACKUP_GET_MANIFEST: 'backup:get-manifest',
   BACKUP_RUN_MIRROR_SYNC: 'backup:run-mirror-sync',
+
+  // Supabase sync
+  SYNC_STATUS: 'sync:status',
+  SYNC_NOW: 'sync:now',
+  SYNC_FULL_PUSH: 'sync:full-push',
+  SYNC_FULL_PULL: 'sync:full-pull',
+  /** Renderer ontvangt voortgangsupdate van sync. */
+  SYNC_PROGRESS: 'sync:progress',
+  /** Proefselectie op Supabase (URL/key + RLS). */
+  SYNC_TEST_CONNECTION: 'sync:test-connection',
 
   // Settings
   SETTINGS_GET: 'settings:get',
@@ -127,9 +165,14 @@ export const IPC = {
   AGENT_LEARN_CORRECTION: 'agent:learn-correction',
   AGENT_WEB_SEARCH: 'agent:web-search',
   AGENT_PIN_SEARCH_RESULT: 'agent:pin-search-result',
+  AGENT_DELETE_PINNED_NOTE: 'agent:delete-pinned-note',
   AGENT_GET_FILL_SUMMARY: 'agent:get-fill-summary',
   AGENT_EXPORT_FILL: 'agent:export-fill',
   AGENT_EXPORT_FILLED_DOCUMENT: 'agent:export-filled-document',
+  /** Checklist "te verzamelen informatie" per document — laden */
+  AGENT_GET_DOC_CHECKLIST: 'agent:get-doc-checklist',
+  /** Checklist-item af- of aanvinken */
+  AGENT_TOGGLE_DOC_CHECKLIST_ITEM: 'agent:toggle-doc-checklist-item',
 
   // Bedrijfsprofielen (bedrijfsgegevens voor invullen van aanbestedingsdocumenten)
   BEDRIJFSPROFIELEN_LIST: 'bedrijfsprofielen:list',
@@ -149,6 +192,23 @@ export const IPC = {
   APP_UPDATE_AVAILABLE: 'app:update-available',
   APP_UPDATE_DOWNLOADED: 'app:update-downloaded',
   APP_UPDATE_PROGRESS: 'app:update-progress',
+
+  // Tender-updates (notificaties: nieuwe documenten / heranalyseerde tenders)
+  TENDER_UPDATES_LIST: 'tender-updates:list',
+  TENDER_UPDATES_COUNT: 'tender-updates:count',
+  TENDER_UPDATES_MARK_READ: 'tender-updates:mark-read',
+  TENDER_UPDATES_MARK_ALL_READ: 'tender-updates:mark-all-read',
+  TENDER_UPDATES_CLEAR: 'tender-updates:clear',
+  /** Haal ongelezen update(s) op voor één specifieke tender. */
+  TENDER_UPDATES_FOR_TENDER: 'tender-updates:for-tender',
+  /** Main → renderer: nieuw batch na scrape klaar */
+  TENDER_UPDATES_NEW: 'tender-updates:new',
+
+  /** App-releases: lijst, concept, live zetten, verwijderen (Supabase) */
+  RELEASE_LIST: 'release:list',
+  RELEASE_CREATE_DRAFT: 'release:create-draft',
+  RELEASE_DELETE_DRAFT: 'release:delete-draft',
+  RELEASE_PROMOTE_LIVE: 'release:promote-live',
 } as const
 
 export const DEFAULT_SEARCH_TERMS = [
@@ -211,3 +271,14 @@ export const DEFAULT_AI_QUESTIONS = [
 /** `app_settings`-keys voor bewerkbare risicoprompts (Instellingen → Prompts). */
 export const APP_SETTING_RISICO_PROMPT_HOOFD = 'risico_prompt_hoofd'
 export const APP_SETTING_RISICO_PROMPT_EXTRACTIE = 'risico_prompt_extractie'
+
+/** `app_settings`-key voor bewerkbare prompt voor document-invul-pre-analyse (velden + checklist). */
+export const APP_SETTING_DOC_FILL_PROMPT = 'document_fill_prompt'
+
+/**
+ * `app_settings`-key: na tracking direct volledige AI-analyse + risico voor nieuwe aanbestedingen (`1`/`0`).
+ * Standaard aan (ontbrekende key telt als aan), zie `isPostScrapeAnalyzeImmediatelyEnabled`.
+ * Als het werkgebied op de kaart actief is (straal + profiel in app_settings, zie `tender-work-area`),
+ * worden alleen tenders binnen die straal automatisch in de wachtrij gezet; de rest is handmatige analyse.
+ */
+export const APP_SETTING_POST_SCRAPE_ANALYZE_IMMEDIATELY = 'post_scrape_analyze_immediately'

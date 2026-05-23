@@ -1,8 +1,9 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
-import { useSources, useScrapeJobs } from '../hooks/use-ipc'
+import { useScrapeJobs } from '../hooks/use-ipc'
 import { api, isElectron } from '../lib/ipc-client'
 import { useScrapeSessionStore } from '../stores/scrape-session-store'
-import { formatDateTime } from '../lib/utils'
+import { formatDateTimeNlFromSqliteUtc } from '@shared/date-format'
+import { APP_SETTING_POST_SCRAPE_ANALYZE_IMMEDIATELY } from '@shared/constants'
 import {
   Play, Loader2, CheckCircle2, XCircle, Clock,
   LogIn, Globe, Shield, ShieldCheck, RefreshCw, AlertCircle, Trash2, FolderSync, StopCircle,
@@ -12,10 +13,8 @@ import { AppConfirmDialog } from '../components/app-confirm-dialog'
 type ScrapingConfirm = null | 'resume-docs' | 'delete-jobs' | 'delete-all-history'
 
 export function ScrapingPage() {
-  const { data: sources } = useSources()
   const { data: jobs, refresh: refreshJobs } = useScrapeJobs()
   const [authStatuses, setAuthStatuses] = useState<any[]>([])
-  const [selectedSources, setSelectedSources] = useState<string[]>([])
   const [showAllJobs, setShowAllJobs] = useState(false)
   const scraping = useScrapeSessionStore((s) => s.pipelineRunning)
   const progress = useScrapeSessionStore((s) => s.progress)
@@ -35,6 +34,8 @@ export function ScrapingPage() {
   const [scrapingConfirm, setScrapingConfirm] = useState<ScrapingConfirm>(null)
   const [deleteJobsBusy, setDeleteJobsBusy] = useState(false)
   const [deleteAllHistoryBusy, setDeleteAllHistoryBusy] = useState(false)
+  const [postScrapeAnalyzeImmediate, setPostScrapeAnalyzeImmediate] = useState(true)
+  const [postScrapeSettingLoaded, setPostScrapeSettingLoaded] = useState(false)
   const docResumeStatusRef = useRef<string | undefined>(undefined)
 
   const loadPendingDocFetch = useCallback(async () => {
@@ -71,6 +72,30 @@ export function ScrapingPage() {
 
   useEffect(() => {
     api.getAuthStatus().then((s: any) => s && setAuthStatuses(s))
+  }, [])
+
+  useEffect(() => {
+    if (!isElectron) {
+      setPostScrapeSettingLoaded(true)
+      return
+    }
+    void (async () => {
+      try {
+        const all = (await api.getAllSettings()) as Record<string, string> | null
+        const v = all?.[APP_SETTING_POST_SCRAPE_ANALYZE_IMMEDIATELY]
+        if (v === undefined) setPostScrapeAnalyzeImmediate(true)
+        else {
+          const low = String(v).trim().toLowerCase()
+          setPostScrapeAnalyzeImmediate(
+            low === '1' || low === 'true' || low === 'yes' || low === 'on',
+          )
+        }
+      } catch {
+        setPostScrapeAnalyzeImmediate(true)
+      } finally {
+        setPostScrapeSettingLoaded(true)
+      }
+    })()
   }, [])
 
   const [loginError, setLoginError] = useState<string | null>(null)
@@ -112,13 +137,21 @@ export function ScrapingPage() {
   }, [])
 
   const handleStartScrape = () => {
-    void runScrape({
-      sourceIds: selectedSources.length > 0 ? selectedSources : undefined,
-    })
+    void runScrape({})
   }
 
-  const allSources = (sources as any[]) || []
-  const authRequired = authStatuses.filter(s => !s.isAuthenticated)
+  const setPostScrapeImmediateSetting = useCallback(async (checked: boolean) => {
+    if (!isElectron) {
+      setPostScrapeAnalyzeImmediate(checked)
+      return
+    }
+    setPostScrapeAnalyzeImmediate(checked)
+    try {
+      await api.setSetting(APP_SETTING_POST_SCRAPE_ANALYZE_IMMEDIATELY, checked ? '1' : '0')
+    } catch {
+      setPostScrapeAnalyzeImmediate((prev) => !prev)
+    }
+  }, [])
 
   const allJobs = useMemo(() => ((jobs as { id: string }[]) || []).filter(j => j?.id), [jobs])
 
@@ -304,7 +337,9 @@ export function ScrapingPage() {
             <Shield className="h-4 w-4" /> Inlogstatus websites
           </h3>
           <p className="text-xs text-[var(--muted-foreground)] mb-4">
-            Log eerst in op alle websites die authenticatie vereisen, voordat je begint met tracking.
+            Hier zie je per bron of er een app-sessie is. Voor bronnen met inlog: log hier in vóór je start, of voltooi de
+            vensters die na «Start tracking» verschijnen (zelfde werkwijze als geplande tracking). Uitloggen wist de
+            sessie voor die site.
           </p>
           {loginError && (
             <div className="mb-4 flex items-center gap-2 rounded-lg border border-red-200 dark:border-red-700/50 bg-red-50 dark:bg-red-950/30 px-4 py-2.5 text-sm text-red-700 dark:text-red-300">
@@ -372,39 +407,14 @@ export function ScrapingPage() {
       {/* Tracking launcher */}
       <div className="rounded-xl border bg-[var(--card)] p-5 shadow-sm">
         <h3 className="text-sm font-semibold text-[var(--foreground)] mb-2 flex items-center gap-2">
-          <Globe className="h-4 w-4" /> Bronnen selecteren
+          <Play className="h-4 w-4" /> Handmatige tracking
         </h3>
         <p className="text-xs text-[var(--muted-foreground)] mb-4 leading-relaxed">
-          Resultaten worden eerst gefilterd op je actieve zoektermen én op het profiel van Van de Kreeke Groep
-          (GWW en civiele werkzaamheden). Alleen wat daarbij past, wordt opgeslagen, zodat je geen tokens verspilt
-          aan kansen die van tevoren al niet relevant zijn.
+          Eerst worden — zoals bij geplande tracking — achtereenvolgens inlogvensters geopend voor bronnen die inloggen
+          nodig hebben. Daarna worden <strong className="text-[var(--foreground)] font-medium">alle actieve bronnen</strong>{' '}
+          gescraped (dezelfde set als in je bronnenlijst; zie boven «Inlogstatus websites» voor je sessies). Resultaten
+          worden gefilterd op je actieve zoektermen en het Van de Kreeke-profiel (GWW/civiel).
         </p>
-        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 mb-4">
-          {allSources.map((source: any) => (
-            <label
-              key={source.id}
-              className={`flex cursor-pointer items-center gap-3 rounded-lg border p-3 transition-colors ${
-                selectedSources.includes(source.id) ? 'border-[var(--primary)] bg-[var(--primary)]/5' : 'hover:bg-[var(--muted)]/50'
-              }`}
-            >
-              <input
-                type="checkbox"
-                checked={selectedSources.includes(source.id)}
-                onChange={(e) => {
-                  if (e.target.checked) setSelectedSources([...selectedSources, source.id])
-                  else setSelectedSources(selectedSources.filter(id => id !== source.id))
-                }}
-                className="rounded"
-              />
-              <div>
-                <p className="text-sm font-medium">{source.naam}</p>
-                <p className="text-[10px] text-[var(--muted-foreground)]">
-                  {source.laatste_sync ? `Laatste sync: ${formatDateTime(source.laatste_sync)}` : 'Nog niet gesynchroniseerd'}
-                </p>
-              </div>
-            </label>
-          ))}
-        </div>
 
         <button
           onClick={handleStartScrape}
@@ -424,22 +434,22 @@ export function ScrapingPage() {
 
       {/* Hervat documentophalen (na onderbroken post-tracking) */}
       {isElectron && pendingDocFetch.count > 0 && (
-        <div className="rounded-xl border border-amber-200 dark:border-amber-700/50 bg-amber-50/50 dark:bg-amber-950/25 p-5 shadow-sm">
+        <div className="doc-resume-banner-copy rounded-xl border border-amber-200 dark:border-amber-700/50 bg-amber-50 dark:bg-amber-950/25 p-5 shadow-sm">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="flex gap-3">
-              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-300">
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-amber-100 dark:bg-amber-900/40 text-zinc-900 dark:text-amber-300">
                 <FolderSync className="h-5 w-5" />
               </div>
               <div>
-                <h3 className="text-sm font-semibold text-amber-950 dark:text-amber-200">Documentophalen afmaken</h3>
-                <p className="mt-1 text-xs text-amber-900/90 dark:text-amber-300/90 leading-relaxed max-w-xl">
+                <h3 className="text-sm font-semibold">Documentophalen afmaken</h3>
+                <p className="mt-1 text-xs leading-relaxed max-w-xl">
                   Na de tracking worden documenten per aanbesteding opgehaald. Daarvoor{' '}
                   <strong>{pendingDocFetch.count}</strong> {pendingDocFetch.count === 1 ? 'tender is' : 'tenders zijn'}{' '}
                   nog niet volledig afgerond. Je kunt dit hervatten zonder nieuwe tracking; reeds opgeslagen
                   bestanden en tussenresultaten blijven behouden.
                 </p>
                 {pendingDocFetch.items.length > 0 && pendingDocFetch.items.length <= 5 && (
-                  <ul className="mt-2 text-[11px] text-amber-900/80 dark:text-amber-300/80 list-disc pl-4 space-y-0.5">
+                  <ul className="mt-2 text-[11px] list-disc pl-4 space-y-0.5">
                     {pendingDocFetch.items.slice(0, 5).map((t) => (
                       <li key={t.id} className="truncate">{t.titel || t.id}</li>
                     ))}
@@ -506,14 +516,28 @@ export function ScrapingPage() {
           <div className="rounded-xl border bg-[var(--card)] shadow-sm">
             <div className="flex flex-wrap items-center justify-between gap-3 border-b px-5 py-4">
               <h3 className="text-sm font-semibold">Trackinggeschiedenis</h3>
-              <div className="flex flex-wrap items-center gap-2">
+              <div className="flex flex-wrap items-center justify-end gap-2 sm:gap-3">
+                {isElectron && postScrapeSettingLoaded && (
+                  <label
+                    className="inline-flex max-w-full cursor-pointer items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--muted)]/30 px-3 py-1.5 text-xs text-[var(--foreground)]"
+                    title="Met werkgebied actief op de kaart (straal + vestiging): alleen aanbestedingen binnen die cirkel gaan automatisch in de AI-wachtrij. Buiten het gebied: start analyse handmatig op de detailpagina."
+                  >
+                    <input
+                      type="checkbox"
+                      className="rounded"
+                      checked={postScrapeAnalyzeImmediate}
+                      onChange={(e) => void setPostScrapeImmediateSetting(e.target.checked)}
+                    />
+                    <span className="select-none">Verwerk meteen analyse</span>
+                  </label>
+                )}
                 {allJobs.length > 0 && (
                   <>
                     <button
                       type="button"
                       onClick={() => setScrapingConfirm('delete-jobs')}
                       disabled={selectedJobIds.length === 0}
-                      className="inline-flex items-center gap-1.5 rounded-lg border border-red-200 dark:border-red-700/50 bg-red-50 dark:bg-red-950/30 px-3 py-1.5 text-xs font-medium text-red-700 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-950/50 disabled:pointer-events-none disabled:opacity-40 transition-colors"
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-red-200 dark:border-red-700/50 bg-red-50 dark:bg-red-950/30 px-3 py-1.5 text-xs font-medium text-[var(--foreground)] dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-950/50 disabled:pointer-events-none disabled:opacity-40 transition-colors"
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                       Verwijder geselecteerde ({selectedJobIds.length})
@@ -581,15 +605,31 @@ export function ScrapingPage() {
                     {job.status === 'gereed' && <CheckCircle2 className="h-4 w-4 text-green-500 shrink-0" />}
                     {job.status === 'fout' && <XCircle className="h-4 w-4 text-red-500 shrink-0" />}
                     <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium truncate">{job.bron_naam}</p>
-                      <p className="text-[10px] text-[var(--muted-foreground)]">
-                        {formatDateTime(job.created_at)}
-                        {job.zoekterm && ` — "${job.zoekterm}"`}
+                      <div className="flex flex-wrap items-baseline gap-2">
+                        <p className="text-sm font-medium truncate">{job.bron_naam}</p>
+                        <span className="shrink-0 text-[10px] font-medium text-[var(--muted-foreground)] rounded bg-[var(--muted)] px-1.5 py-0.5">
+                          {job.triggered_by === 'scheduled' ? 'Gepland' : 'Handmatig'}
+                        </span>
+                      </div>
+                      <p className="text-[10px] text-[var(--muted-foreground)] mt-0.5">
+                        <span>
+                          Gestart:{' '}
+                          {formatDateTimeNlFromSqliteUtc(job.started_at || job.created_at)}
+                        </span>
+                        <span className="mx-1">·</span>
+                        <span>
+                          {job.status === 'bezig'
+                            ? 'Beëindigd: — (bezig)'
+                            : `Beëindigd: ${formatDateTimeNlFromSqliteUtc(job.completed_at)}`}
+                        </span>
                       </p>
+                      {job.zoekterm && (
+                        <p className="text-[10px] text-[var(--muted-foreground)] mt-0.5">Zoekterm: &quot;{job.zoekterm}&quot;</p>
+                      )}
                     </div>
                     <div className="text-right shrink-0">
-                      <p className="text-sm font-medium">{job.aantal_gevonden}</p>
-                      <p className="text-[10px] text-[var(--muted-foreground)]">gevonden</p>
+                      <p className="text-sm font-medium tabular-nums">{job.aantal_gevonden ?? 0}</p>
+                      <p className="text-[10px] text-[var(--muted-foreground)]">nieuwe</p>
                     </div>
                   </div>
                 ))

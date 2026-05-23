@@ -3,6 +3,8 @@ import { getDb } from '../db/connection'
 import { IPC } from '../../shared/constants'
 import { generatePdf } from '../export/pdf-generator'
 import { generateWord } from '../export/word-generator'
+import { generateTenderSummaryPdf, generateTenderSummaryWord } from '../export/tender-summary-export'
+import type { TenderSummaryExportPayload } from '../../shared/types'
 import { getMainWindow } from '../index'
 import fs from 'fs'
 import log from 'electron-log'
@@ -65,4 +67,43 @@ export function registerExportHandlers(): void {
       return { success: false, error: error.message }
     }
   })
+
+  ipcMain.handle(
+    IPC.EXPORT_TENDER_SUMMARY,
+    async (_event, payload: { format: 'pdf' | 'word'; data: TenderSummaryExportPayload }) => {
+      const data = payload?.data
+      if (!data?.titel?.trim()) {
+        return { success: false, error: 'Geen titel voor export' }
+      }
+      const sanitize = (name: string) =>
+        name.replace(/[\\/:*?"<>|]/g, '-').replace(/\s+/g, ' ').trim().slice(0, 72)
+      const datePart = new Date().toISOString().slice(0, 10)
+      const baseName = `Samenvatting — ${sanitize(data.titel)} — ${datePart}`
+
+      try {
+        const buffer =
+          payload.format === 'pdf'
+            ? await generateTenderSummaryPdf(data)
+            : await generateTenderSummaryWord(data)
+        const defaultName = payload.format === 'pdf' ? `${baseName}.pdf` : `${baseName}.docx`
+        const mainWindow = getMainWindow()
+        const result = await dialog.showSaveDialog(mainWindow!, {
+          defaultPath: defaultName,
+          filters:
+            payload.format === 'pdf'
+              ? [{ name: 'PDF', extensions: ['pdf'] }]
+              : [{ name: 'Word', extensions: ['docx'] }],
+        })
+        if (!result.canceled && result.filePath) {
+          fs.writeFileSync(result.filePath, buffer)
+          return { success: true, filePath: result.filePath }
+        }
+        return { success: false, error: 'Export geannuleerd' }
+      } catch (error: unknown) {
+        const msg = error instanceof Error ? error.message : String(error)
+        log.error('Tender summary export failed:', error)
+        return { success: false, error: msg }
+      }
+    },
+  )
 }

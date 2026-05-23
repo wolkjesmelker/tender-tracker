@@ -3,14 +3,26 @@ import log from 'electron-log'
 import fs from 'fs'
 import path from 'path'
 import { getDb } from '../db/connection'
+import { requestDebouncedCloudPush } from '../db/supabase-sync'
 import { IPC } from '../../shared/constants'
-import type { Aanbesteding, BronNavigatieLink, DashboardStats, TenderProcedureContext } from '../../shared/types'
+import type {
+  Aanbesteding,
+  BronNavigatieLink,
+  DashboardStats,
+  StoredDocumentEntry,
+  TenderProcedureContext,
+} from '../../shared/types'
 import {
+  assertSafeDocumentFileName,
+  getTenderDocumentsDir,
   listTenderDocumentFiles,
   removeTenderDocumentsFolders,
   resolveTenderDocumentFile,
+  uniqueFileNameInDir,
 } from '../utils/paths'
 import { discoverDocumentsFromBronWithAi } from '../ai/document-discovery'
+import { enqueueIncrementalManualDocumentAnalysis } from './analysis.ipc'
+import { resolveTenderGeocodes, geocodeAddressString } from '../geocoding/tender-geocoder'
 import { getMainWindow } from '../index'
 import { acquireBusyWorkBlocker, releaseBusyWorkBlocker } from '../utils/busy-work-blocker'
 import { IMAGE_PREVIEW_EXT, MAX_INLINE_PREVIEW_BYTES } from '../../shared/local-doc-preview'
@@ -32,6 +44,11 @@ import {
 } from '../scraping/procedure-context'
 import { randomUUID } from 'crypto'
 import os from 'os'
+import {
+  bronFileLinkStableKey,
+  catalogDocumentStableKey,
+  parseCatalogSelectedKeys,
+} from '../../shared/catalog-document-key'
 
 function parseStoredDocumentUrlsForNormalize(json: string | null | undefined): DocumentInfo[] {
   if (!json?.trim()) return []
@@ -45,6 +62,7 @@ function parseStoredDocumentUrlsForNormalize(json: string | null | undefined): D
         naam: String(x.naam || 'Document'),
         type: String(x.type || ''),
         bronZipLabel: x.bronZipLabel ? String(x.bronZipLabel) : undefined,
+        addedByUser: Boolean(x.addedByUser),
       }))
       .filter((d: DocumentInfo) => Boolean(d.url?.trim() || d.localNaam?.trim()))
   } catch {
@@ -161,6 +179,207 @@ export function registerTenderHandlers(): void {
     }
   })
 
+  ipcMain.handle(IPC.TENDERS_ADD_MANUAL_DOCUMENTS, async (_event, tenderId: string) => {
+    const id = String(tenderId || '').trim()
+    if (!id) return { success: false as const, error: 'Geen aanbesteding geselecteerd.' }
+    const db = getDb()
+    const row = db.prepare('SELECT id, document_urls FROM aanbestedingen WHERE id = ?').get(id) as
+      | { id: string; document_urls: string | null }
+      | undefined
+    if (!row) return { success: false as const, error: 'Aanbesteding niet gevonden.' }
+
+    const win = getMainWindow()
+    const { canceled, filePaths } = await dialog.showOpenDialog(win ?? undefined, {
+      title: 'Documenten toevoegen aan deze aanbesteding',
+      buttonLabel: 'Toevoegen',
+      properties: ['openFile', 'multiSelections'],
+      filters: [
+        {
+          name: 'Documenten',
+          extensions: [
+            'pdf',
+            'doc',
+            'docx',
+            'xls',
+            'xlsx',
+            'ppt',
+            'pptx',
+            'zip',
+            'txt',
+            'csv',
+            'xml',
+            'rtf',
+            'odt',
+            'ods',
+          ],
+        },
+        { name: 'Alle bestanden', extensions: ['*'] },
+      ],
+    })
+    if (canceled || !filePaths?.length) {
+      return { success: false as const, cancelled: true as const }
+    }
+
+    const destDir = getTenderDocumentsDir(id)
+    fs.mkdirSync(destDir, { recursive: true })
+
+    let docs: StoredDocumentEntry[] = []
+    try {
+      if (row.document_urls?.trim()) {
+        const arr = JSON.parse(row.document_urls)
+        if (Array.isArray(arr)) docs = arr as StoredDocumentEntry[]
+      }
+    } catch {
+      docs = []
+    }
+
+    const addedNames: string[] = []
+    for (const srcPath of filePaths) {
+      const base = path.basename(srcPath)
+      const unique = uniqueFileNameInDir(destDir, base)
+      if (!unique) {
+        log.warn(`[tenders] add-manual-documents: onveilige bestandsnaam overgeslagen: ${base}`)
+        continue
+      }
+      const destPath = path.join(destDir, unique)
+      try {
+        fs.copyFileSync(srcPath, destPath)
+      } catch (e) {
+        log.warn('[tenders] add-manual-documents copy failed', e)
+        continue
+      }
+      const ext = path.extname(unique).replace(/^\./, '').toUpperCase() || 'FILE'
+      docs.push({
+        naam: unique,
+        localNaam: unique,
+        type: ext,
+        addedByUser: true,
+      })
+      addedNames.push(unique)
+    }
+
+    if (!addedNames.length) {
+      return {
+        success: false as const,
+        error: 'Geen bestanden toegevoegd (kopiëren mislukt of ongeldige namen).',
+      }
+    }
+
+    db.prepare(`UPDATE aanbestedingen SET document_urls = ?, updated_at = datetime('now') WHERE id = ?`).run(
+      JSON.stringify(docs),
+      id,
+    )
+    log.info(`[tenders] add-manual-documents: ${addedNames.length} bestand(en) voor ${id}`)
+    enqueueIncrementalManualDocumentAnalysis(id, addedNames)
+    requestDebouncedCloudPush()
+    return { success: true as const, added: addedNames }
+  })
+
+  ipcMain.handle(
+    IPC.TENDERS_REMOVE_CATALOG_ENTRIES,
+    (_event, tenderId: string, rawKeys: unknown) => {
+      const id = String(tenderId || '').trim()
+      const keys = Array.isArray(rawKeys)
+        ? rawKeys.filter((k): k is string => typeof k === 'string' && k.length > 0)
+        : []
+      if (!id) {
+        return { success: false as const, error: 'Geen aanbesteding.' }
+      }
+      if (keys.length === 0) {
+        return { success: true as const, removedDocs: 0, removedBron: 0 }
+      }
+      const toRemove = new Set(keys)
+      const db = getDb()
+      const row = db
+        .prepare(
+          `SELECT id, document_urls, bron_navigatie_links, document_catalog_selected_keys FROM aanbestedingen WHERE id = ?`,
+        )
+        .get(id) as
+        | {
+            id: string
+            document_urls: string | null
+            bron_navigatie_links: string | null
+            document_catalog_selected_keys: string | null
+          }
+        | undefined
+      if (!row) {
+        return { success: false as const, error: 'Aanbesteding niet gevonden.' }
+      }
+
+      let docs: StoredDocumentEntry[] = []
+      try {
+        if (row.document_urls?.trim()) {
+          const arr = JSON.parse(row.document_urls) as unknown
+          if (Array.isArray(arr)) {
+            docs = arr
+              .map((x: Record<string, unknown>) => ({
+                url: x.url ? String(x.url) : undefined,
+                localNaam: x.localNaam ? String(x.localNaam) : undefined,
+                naam: String(x.naam || 'Document'),
+                type: String(x.type || ''),
+                bronZipLabel: x.bronZipLabel ? String(x.bronZipLabel) : undefined,
+                addedByUser: Boolean(x.addedByUser),
+              }))
+              .filter((d: StoredDocumentEntry) => Boolean(d.url?.trim() || d.localNaam?.trim()))
+          }
+        }
+      } catch {
+        docs = []
+      }
+
+      const dir = getTenderDocumentsDir(id)
+      const removedEntries = docs.filter((d) => toRemove.has(catalogDocumentStableKey(d)))
+      for (const d of removedEntries) {
+        const ln = d.localNaam?.trim()
+        if (!ln) continue
+        const safe = assertSafeDocumentFileName(ln)
+        if (!safe) continue
+        const fp = path.join(dir, safe)
+        try {
+          const resolved = path.resolve(fp)
+          const base = path.resolve(dir)
+          if (!resolved.startsWith(base + path.sep) && resolved !== base) continue
+          if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
+            fs.unlinkSync(resolved)
+          }
+        } catch (e) {
+          log.warn(`[tenders] remove-catalog: unlink ${ln} mislukt`, e)
+        }
+      }
+
+      const newDocs = docs.filter((d) => !toRemove.has(catalogDocumentStableKey(d)))
+      let bronLinks: BronNavigatieLink[] = parseBronNavForProc(row.bron_navigatie_links)
+      const beforeBron = bronLinks.length
+      bronLinks = bronLinks.filter((l) => !toRemove.has(bronFileLinkStableKey(l.url)))
+      const removedBron = beforeBron - bronLinks.length
+
+      const sel = parseCatalogSelectedKeys(
+        typeof row.document_catalog_selected_keys === 'string'
+          ? row.document_catalog_selected_keys
+          : undefined,
+      )
+      for (const k of keys) {
+        sel.delete(k)
+      }
+
+      db.prepare(
+        `UPDATE aanbestedingen SET document_urls = ?, bron_navigatie_links = ?, document_catalog_selected_keys = ?, updated_at = datetime('now') WHERE id = ?`,
+      ).run(
+        JSON.stringify(newDocs),
+        JSON.stringify(bronLinks),
+        JSON.stringify([...sel]),
+        id,
+      )
+
+      requestDebouncedCloudPush()
+      return {
+        success: true as const,
+        removedDocs: removedEntries.length,
+        removedBron,
+      }
+    },
+  )
+
   ipcMain.handle(IPC.TENDERS_UPDATE, (_event, id: string, data: Partial<Aanbesteding>) => {
     const db = getDb()
     const fields = Object.keys(data).filter(k => k !== 'id' && k !== 'created_at')
@@ -172,13 +391,24 @@ export function registerTenderHandlers(): void {
     db.prepare(`UPDATE aanbestedingen SET ${setClause}, updated_at = datetime('now') WHERE id = ?`)
       .run(...values, id)
 
+    requestDebouncedCloudPush()
     return db.prepare('SELECT * FROM aanbestedingen WHERE id = ?').get(id)
   })
 
   ipcMain.handle(IPC.TENDERS_DELETE, (_event, id: string) => {
     const db = getDb()
+    // Sla bron_url op in blocklist zodat de aanbesteding na verwijdering niet meer terugkomt
+    const row = db.prepare('SELECT bron_url, bron_website_id FROM aanbestedingen WHERE id = ?').get(id) as
+      | { bron_url: string | null; bron_website_id: string | null }
+      | undefined
+    if (row?.bron_url?.trim()) {
+      db.prepare(
+        'INSERT OR REPLACE INTO verwijderde_bron_urls (bron_url, bron_website_id) VALUES (?, ?)'
+      ).run(row.bron_url, row.bron_website_id ?? null)
+    }
     removeTenderDocumentsFolders(id)
     db.prepare('DELETE FROM aanbestedingen WHERE id = ?').run(id)
+    requestDebouncedCloudPush()
     return { success: true }
   })
 
@@ -187,11 +417,27 @@ export function registerTenderHandlers(): void {
     if (!Array.isArray(ids) || ids.length === 0) {
       return { success: true, deleted: 0 }
     }
+    // Sla alle bron_urls op in blocklist vóór verwijdering
+    const placeholders = ids.map(() => '?').join(',')
+    const rows = db.prepare(
+      `SELECT bron_url, bron_website_id FROM aanbestedingen WHERE id IN (${placeholders})`
+    ).all(...ids) as { bron_url: string | null; bron_website_id: string | null }[]
+    const insertBlocklist = db.prepare(
+      'INSERT OR REPLACE INTO verwijderde_bron_urls (bron_url, bron_website_id) VALUES (?, ?)'
+    )
+    const insertMany = db.transaction(() => {
+      for (const row of rows) {
+        if (row.bron_url?.trim()) {
+          insertBlocklist.run(row.bron_url, row.bron_website_id ?? null)
+        }
+      }
+    })
+    insertMany()
     for (const id of ids) {
       removeTenderDocumentsFolders(id)
     }
-    const placeholders = ids.map(() => '?').join(',')
     const info = db.prepare(`DELETE FROM aanbestedingen WHERE id IN (${placeholders})`).run(...ids)
+    requestDebouncedCloudPush()
     return { success: true, deleted: info.changes }
   })
 
@@ -311,6 +557,7 @@ export function registerTenderHandlers(): void {
       id
     )
     log.info(`TENDERS_NORMALIZE_ON_OPEN ${id}: docs=${docsChanged} procedure=${Boolean(procOut)}`)
+    requestDebouncedCloudPush()
     return { success: true as const, updated: true }
   })
 
@@ -425,6 +672,29 @@ export function registerTenderHandlers(): void {
         return { success: false as const, error: msg || 'Download mislukt' }
       }
     }
+  )
+
+  ipcMain.handle(IPC.TENDERS_RESOLVE_MAP_GEOCODES, async (_event, ids: string[]) => {
+    const list = Array.isArray(ids) ? ids.map((s) => String(s || '').trim()).filter(Boolean) : []
+    if (list.length === 0) return { resolved: [] }
+    const mainWindow = getMainWindow()
+    const resolved = await resolveTenderGeocodes(list, (p) => {
+      mainWindow?.webContents.send(IPC.TENDERS_RESOLVE_MAP_GEOCODES_PROGRESS, p)
+    })
+    return { resolved }
+  })
+
+  ipcMain.handle(
+    IPC.GEOCODE_ADDRESS,
+    async (
+      _event,
+      adres: string | undefined,
+      postcode: string | undefined,
+      stad: string | undefined,
+      land: string | undefined,
+    ) => {
+      return geocodeAddressString(adres, postcode, stad, land)
+    },
   )
 
   ipcMain.handle(IPC.TENDERS_BRON_EMBED_PARTITION, (_event, tenderId: string) => {

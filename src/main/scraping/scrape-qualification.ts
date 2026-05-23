@@ -198,6 +198,14 @@ function isStaffingOrVacancyProcurement(combined: string): boolean {
   return STAFFING_OR_VACANCY_PATTERNS.some((re) => re.test(combined))
 }
 
+/** Snelle regex-prealias voor personeel/vacature (o.a. als OpenAPI-sleutel ontbreekt). */
+export function isStaffingOrVacancyByHeuristic(fields: ScrapeTextFields): boolean {
+  const combined = [fields.titel || '', fields.beschrijving || '', fields.ruwe_tekst || '']
+    .join('\n')
+    .toLowerCase()
+  return isStaffingOrVacancyProcurement(combined)
+}
+
 /**
  * Minimaal één actieve zoekterm moet in de tekst voorkomen (zelfde gedrag als voorheen),
  * plus een duidelijk GWW/civiel-signaal. Optioneel: filter op niet-civiele dominantie.

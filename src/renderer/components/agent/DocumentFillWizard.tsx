@@ -1,8 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { X, AlertTriangle, Sparkles, BrainCircuit, Loader2, Check, ChevronLeft, ChevronRight, Save, FileDown, Building2, Download } from 'lucide-react'
+import { X, AlertTriangle, Sparkles, BrainCircuit, Loader2, Check, ChevronLeft, ChevronRight, Save, FileDown, Building2, Download, ClipboardList } from 'lucide-react'
 import { api } from '../../lib/ipc-client'
 import { useAgentStore } from '../../stores/agent-store'
-import type { AgentFieldDefinition, AgentFillState, AgentContradictionWarning, BedrijfsProfiel } from '@shared/types'
+import type {
+  AgentFieldDefinition,
+  AgentFillState,
+  AgentContradictionWarning,
+  BedrijfsProfiel,
+  AgentDocumentChecklistItem,
+} from '@shared/types'
 import { cn } from '../../lib/utils'
 
 interface WizardStep {
@@ -99,16 +105,23 @@ export function DocumentFillWizard() {
   const [pending, setPending] = useState<Record<string, NodeJS.Timeout | number | undefined>>({})
   const [exportingPdf, setExportingPdf] = useState(false)
   const [exportPdfDone, setExportPdfDone] = useState(false)
+  const [exportingDocx, setExportingDocx] = useState(false)
+  const [exportDocxDone, setExportDocxDone] = useState(false)
+  /** Waarschuwingen na succesvolle export (bijv. niet-gemapte velden). */
+  const [exportNotes, setExportNotes] = useState<string | null>(null)
   // Bedrijfsprofielen voor auto-invul banner
   const [profielen, setProfielen] = useState<BedrijfsProfiel[]>([])
   const [selectedProfielId, setSelectedProfielId] = useState<string>('')
   const [profielApplied, setProfielApplied] = useState(false)
   const [profielApplying, setProfielApplying] = useState(false)
+  const [checklist, setChecklist] = useState<AgentDocumentChecklistItem[]>([])
+  const [checklistBusy, setChecklistBusy] = useState<Record<string, boolean>>({})
   const loadWizard = useCallback(
     async (reanalyze = false) => {
       if (!tenderId || !documentNaam) return
       setLoading(true)
       setError(null)
+      setExportNotes(null)
       try {
         const res = (await api.agentStartFill?.({
           tenderId,
@@ -120,6 +133,7 @@ export function DocumentFillWizard() {
               error?: string
               steps?: WizardStep[]
               states?: AgentFillState[]
+              checklist?: AgentDocumentChecklistItem[]
             }
           | null
         if (!res?.ok) {
@@ -129,6 +143,9 @@ export function DocumentFillWizard() {
         }
         setSteps(res.steps || [])
         setStates(res.states || [])
+        setChecklist(
+          [...(res.checklist || [])].sort((a, b) => a.order - b.order),
+        )
         const vs: FieldValueMap = {}
         const ps: FieldValueMap = {}
         const ss: Record<string, 'ai' | 'user' | 'learning'> = {}
@@ -191,6 +208,9 @@ export function DocumentFillWizard() {
       setProfielen([])
       setSelectedProfielId('')
       setProfielApplied(false)
+      setChecklist([])
+      setChecklistBusy({})
+      setExportNotes(null)
     }
   }, [open, loadWizard])
 
@@ -201,6 +221,61 @@ export function DocumentFillWizard() {
     [values],
   )
   const currentStep = steps[stepIndex]
+
+  const checklistTotal = checklist.length
+  const checklistDone = useMemo(
+    () => checklist.filter((it) => it.done).length,
+    [checklist],
+  )
+  const checklistPercent =
+    checklistTotal > 0 ? Math.round((checklistDone / checklistTotal) * 100) : 0
+
+  const handleToggleChecklistItem = useCallback(
+    async (item: AgentDocumentChecklistItem) => {
+      if (!tenderId || !documentNaam) return
+      const next = !item.done
+      setChecklist((list) =>
+        list.map((it) =>
+          it.item_id === item.item_id
+            ? { ...it, done: next, done_at: next ? new Date().toISOString() : undefined }
+            : it,
+        ),
+      )
+      setChecklistBusy((b) => ({ ...b, [item.item_id]: true }))
+      try {
+        const res = (await api.agentToggleDocChecklistItem?.({
+          tenderId,
+          documentNaam,
+          itemId: item.item_id,
+          done: next,
+        })) as { ok: boolean; item?: AgentDocumentChecklistItem; error?: string } | null
+        if (!res?.ok) {
+          setChecklist((list) =>
+            list.map((it) =>
+              it.item_id === item.item_id ? { ...it, done: item.done } : it,
+            ),
+          )
+        } else if (res.item) {
+          setChecklist((list) =>
+            list.map((it) => (it.item_id === item.item_id ? res.item! : it)),
+          )
+        }
+      } catch {
+        setChecklist((list) =>
+          list.map((it) =>
+            it.item_id === item.item_id ? { ...it, done: item.done } : it,
+          ),
+        )
+      } finally {
+        setChecklistBusy((b) => {
+          const n = { ...b }
+          delete n[item.item_id]
+          return n
+        })
+      }
+    },
+    [tenderId, documentNaam],
+  )
 
   // Alle velden (plat, voor profielmatch)
   const allFields = useMemo(() => steps.flatMap((s) => s.fields), [steps])
@@ -314,12 +389,46 @@ export function DocumentFillWizard() {
   const handleExportPdf = async () => {
     if (!tenderId || !documentNaam) return
     setExportingPdf(true)
+    setExportNotes(null)
+    setError(null)
     try {
-      await api.agentExportFilledDocument?.({ tenderId, documentNaam })
+      const res = (await api.agentExportFilledDocument?.({ tenderId, documentNaam, format: 'pdf' })) as {
+        ok?: boolean
+        error?: string
+        warnings?: string[]
+      } | null
+      if (!res?.ok) {
+        setError(res?.error || 'PDF-export mislukt.')
+        return
+      }
+      if (res.warnings?.length) setExportNotes(res.warnings.join('\n'))
       setExportPdfDone(true)
       setTimeout(() => setExportPdfDone(false), 3000)
     } finally {
       setExportingPdf(false)
+    }
+  }
+
+  const handleExportDocx = async () => {
+    if (!tenderId || !documentNaam) return
+    setExportingDocx(true)
+    setExportNotes(null)
+    setError(null)
+    try {
+      const res = (await api.agentExportFilledDocument?.({ tenderId, documentNaam, format: 'docx' })) as {
+        ok?: boolean
+        error?: string
+        warnings?: string[]
+      } | null
+      if (!res?.ok) {
+        setError(res?.error || 'Word-export mislukt.')
+        return
+      }
+      if (res.warnings?.length) setExportNotes(res.warnings.join('\n'))
+      setExportDocxDone(true)
+      setTimeout(() => setExportDocxDone(false), 3000)
+    } finally {
+      setExportingDocx(false)
     }
   }
 
@@ -356,7 +465,17 @@ export function DocumentFillWizard() {
           </div>
           <div className="flex items-center gap-2">
             <span className="text-xs text-[var(--muted-foreground)]">
-              {filledFields}/{totalFields} velden ingevuld
+              {totalFields > 0 && (
+                <>
+                  {filledFields}/{totalFields} velden
+                </>
+              )}
+              {totalFields > 0 && checklistTotal > 0 && <span className="mx-1">·</span>}
+              {checklistTotal > 0 && (
+                <>
+                  {checklistDone}/{checklistTotal} checklist ({checklistPercent}%)
+                </>
+              )}
             </span>
             <button
               onClick={() => void loadWizard(true)}
@@ -369,7 +488,7 @@ export function DocumentFillWizard() {
               onClick={() => void handleExportPdf()}
               disabled={exportingPdf || filledFields === 0}
               className="flex items-center gap-1 rounded border border-[var(--border)] bg-blue-50 px-2 py-1 text-xs text-blue-700 hover:bg-blue-100 disabled:opacity-50"
-              title="Sla ingevuld document op als PDF"
+              title="Sla het ingevulde brondocument (PDF-formulier) op"
             >
               {exportingPdf ? (
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -378,7 +497,22 @@ export function DocumentFillWizard() {
               ) : (
                 <Download className="h-3.5 w-3.5" />
               )}
-              {exportPdfDone ? 'Opgeslagen' : 'Opslaan PDF'}
+              {exportPdfDone ? 'Opgeslagen' : 'Brondocument PDF'}
+            </button>
+            <button
+              onClick={() => void handleExportDocx()}
+              disabled={exportingDocx || filledFields === 0}
+              className="flex items-center gap-1 rounded border border-[var(--border)] bg-indigo-50 px-2 py-1 text-xs text-indigo-700 hover:bg-indigo-100 disabled:opacity-50"
+              title="Sla het ingevulde brondocument (.docx) op"
+            >
+              {exportingDocx ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : exportDocxDone ? (
+                <Check className="h-3.5 w-3.5 text-green-600" />
+              ) : (
+                <Download className="h-3.5 w-3.5" />
+              )}
+              {exportDocxDone ? 'Opgeslagen' : 'Brondocument Word'}
             </button>
             <button
               onClick={() => void handleExportMarkdown()}
@@ -392,6 +526,12 @@ export function DocumentFillWizard() {
             </button>
           </div>
         </header>
+
+        {exportNotes ? (
+          <div className="border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-950 dark:border-amber-900/50 dark:bg-amber-950/40 dark:text-amber-100 whitespace-pre-line">
+            {exportNotes}
+          </div>
+        ) : null}
 
         {loading ? (
           <div className="flex flex-1 items-center justify-center py-16">
@@ -411,12 +551,13 @@ export function DocumentFillWizard() {
               </button>
             </div>
           </div>
-        ) : steps.length === 0 ? (
+        ) : steps.length === 0 && checklist.length === 0 ? (
           <div className="flex flex-1 items-center justify-center p-6 text-center text-sm text-[var(--muted-foreground)]">
-            Geen invulbare velden gevonden in dit document.
+            Geen invulvelden of checklist-items gevonden in dit document.
           </div>
         ) : (
           <>
+            {steps.length > 0 && (
             <div className="border-b border-[var(--border)] bg-[var(--muted)]/40 px-4 py-2">
               <div className="flex flex-wrap items-center gap-1 text-xs">
                 {steps.map((s, i) => {
@@ -442,6 +583,7 @@ export function DocumentFillWizard() {
                 })}
               </div>
             </div>
+            )}
 
             <div className="flex-1 overflow-y-auto p-4">
               {/* Bedrijfsprofiel banner — toon als er profielen zijn en matchende velden */}
@@ -498,6 +640,97 @@ export function DocumentFillWizard() {
                   </p>
                 </div>
               )}
+              {checklist.length > 0 && (
+                <section className="mb-5 rounded-xl border border-[var(--border)] bg-[var(--background)] shadow-sm">
+                  <header className="sticky top-0 z-[1] flex items-center justify-between gap-3 rounded-t-xl border-b border-[var(--border)] bg-gradient-to-r from-indigo-50 to-white px-4 py-3">
+                    <div className="flex items-center gap-2">
+                      <ClipboardList className="h-4 w-4 text-indigo-600" />
+                      <h3 className="text-sm font-semibold text-indigo-900">
+                        Te verzamelen informatie
+                      </h3>
+                    </div>
+                    <div className="flex items-center gap-3 text-xs">
+                      <span className="text-[var(--muted-foreground)]">
+                        {checklistDone}/{checklistTotal}
+                      </span>
+                      <div className="h-1.5 w-28 overflow-hidden rounded-full bg-indigo-100">
+                        <div
+                          className={cn(
+                            'h-full transition-all duration-300',
+                            checklistPercent >= 100 ? 'bg-green-500' : 'bg-indigo-500',
+                          )}
+                          style={{ width: `${checklistPercent}%` }}
+                        />
+                      </div>
+                      <span
+                        className={cn(
+                          'font-semibold',
+                          checklistPercent >= 100 ? 'text-green-700' : 'text-indigo-700',
+                        )}
+                      >
+                        {checklistPercent}%
+                      </span>
+                    </div>
+                  </header>
+                  <ul className="max-h-[320px] overflow-y-auto divide-y divide-[var(--border)]">
+                    {checklist.map((item) => {
+                      const busy = !!checklistBusy[item.item_id]
+                      return (
+                        <li
+                          key={item.item_id}
+                          className={cn(
+                            'flex items-start gap-3 px-4 py-2.5 transition-colors',
+                            item.done ? 'bg-green-50/40' : 'hover:bg-[var(--muted)]/30',
+                          )}
+                        >
+                          <button
+                            type="button"
+                            onClick={() => void handleToggleChecklistItem(item)}
+                            disabled={busy}
+                            aria-pressed={item.done}
+                            aria-label={`${item.done ? 'Afvinken ongedaan maken' : 'Afvinken'}: ${item.label}`}
+                            className={cn(
+                              'mt-0.5 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded border transition-colors',
+                              item.done
+                                ? 'border-green-500 bg-green-500 text-white'
+                                : 'border-[var(--border)] bg-[var(--background)] hover:border-indigo-400',
+                              busy && 'opacity-50',
+                            )}
+                          >
+                            {busy ? (
+                              <Loader2 className="h-3 w-3 animate-spin" />
+                            ) : item.done ? (
+                              <Check className="h-3.5 w-3.5" />
+                            ) : null}
+                          </button>
+                          <div className="min-w-0 flex-1">
+                            <p
+                              className={cn(
+                                'text-sm leading-snug',
+                                item.done
+                                  ? 'text-[var(--muted-foreground)] line-through'
+                                  : 'text-[var(--foreground)]',
+                              )}
+                            >
+                              {item.label}
+                            </p>
+                            {item.hint && (
+                              <p className="mt-0.5 text-[11px] text-[var(--muted-foreground)]">
+                                {item.hint}
+                              </p>
+                            )}
+                            {item.source_quote && (
+                              <p className="mt-1 border-l-2 border-indigo-200 pl-2 text-[11px] italic text-indigo-800/80">
+                                “{item.source_quote}”
+                              </p>
+                            )}
+                          </div>
+                        </li>
+                      )
+                    })}
+                  </ul>
+                </section>
+              )}
               {currentStep && (
                 <div className="space-y-4">
                   {currentStep.fields.map((f) => (
@@ -528,21 +761,26 @@ export function DocumentFillWizard() {
                 )}
               </div>
               <div className="flex items-center gap-2">
-                <button
-                  onClick={() => setStepIndex(Math.max(0, stepIndex - 1))}
-                  disabled={stepIndex === 0}
-                  className="flex items-center gap-1 rounded border border-[var(--border)] px-3 py-1.5 text-xs hover:bg-[var(--muted)] disabled:opacity-50"
-                >
-                  <ChevronLeft className="h-3.5 w-3.5" /> Vorige
-                </button>
-                {stepIndex < steps.length - 1 ? (
-                  <button
-                    onClick={() => setStepIndex(Math.min(steps.length - 1, stepIndex + 1))}
-                    className="flex items-center gap-1 rounded bg-blue-600 px-3 py-1.5 text-xs text-white hover:bg-blue-700"
-                  >
-                    Volgende <ChevronRight className="h-3.5 w-3.5" />
-                  </button>
-                ) : (
+                {steps.length > 0 && (
+                  <>
+                    <button
+                      onClick={() => setStepIndex(Math.max(0, stepIndex - 1))}
+                      disabled={stepIndex === 0}
+                      className="flex items-center gap-1 rounded border border-[var(--border)] px-3 py-1.5 text-xs hover:bg-[var(--muted)] disabled:opacity-50"
+                    >
+                      <ChevronLeft className="h-3.5 w-3.5" /> Vorige
+                    </button>
+                    {stepIndex < steps.length - 1 && (
+                      <button
+                        onClick={() => setStepIndex(Math.min(steps.length - 1, stepIndex + 1))}
+                        className="flex items-center gap-1 rounded bg-blue-600 px-3 py-1.5 text-xs text-white hover:bg-blue-700"
+                      >
+                        Volgende <ChevronRight className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                  </>
+                )}
+                {(steps.length === 0 || stepIndex >= steps.length - 1) && (
                   <button
                     onClick={closeWizard}
                     className="flex items-center gap-1 rounded bg-green-600 px-3 py-1.5 text-xs text-white hover:bg-green-700"

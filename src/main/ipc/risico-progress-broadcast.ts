@@ -1,12 +1,44 @@
 import { BrowserWindow, type WebContents } from 'electron'
 import { IPC } from '../../shared/constants'
 import { getRisicoRunSnapshot } from './risico-run-state'
+import type { RisicoAnalyseV2Result } from '../../shared/types-risico-v2'
 
 export type RisicoProgressPayload = {
   aanbestedingId: string
   step: string
   percentage: number
   agent: string
+}
+
+export type RisicoDraftSnapshotPayload = {
+  aanbestedingId: string
+  assembledDraftStage: string
+  assembledDraftSavedAt: string
+  assembledDraft: RisicoAnalyseV2Result
+}
+
+const lastDraftByTender = new Map<string, RisicoDraftSnapshotPayload>()
+
+/** Laatste draft-snapshot per tender voor replay na mount. */
+export function getRisicoLastDraftForTender(
+  aanbestedingId: string,
+): RisicoDraftSnapshotPayload | null {
+  return lastDraftByTender.get(aanbestedingId) ?? null
+}
+
+/**
+ * Stuurt assembledDraft-snapshot naar alle vensters na elke stage-overgang.
+ * Wordt bewaard voor replay naar nieuwe vensters/navigatie.
+ */
+export function broadcastRisicoDraftSnapshot(payload: RisicoDraftSnapshotPayload): void {
+  lastDraftByTender.set(payload.aanbestedingId, payload)
+  const wins = BrowserWindow.getAllWindows()
+  for (const w of wins) {
+    const wc = w.webContents
+    if (!wc.isDestroyed()) {
+      wc.send(IPC.RISICO_DRAFT_SNAPSHOT, payload)
+    }
+  }
 }
 
 const lastByTender = new Map<string, { step: string; percentage: number; agent: string }>()
@@ -58,6 +90,7 @@ export function broadcastRisicoProgress(payload: RisicoProgressPayload): void {
 
 /**
  * Na paginaload: misgelopen terminal-events + huidige run (als die nog loopt) opnieuw naar deze renderer.
+ * Stuurt ook de laatste draft-snapshot mee als er een actieve run is.
  */
 export function replayRisicoUiToWebContents(wc: WebContents): void {
   if (wc.isDestroyed()) return
@@ -69,6 +102,12 @@ export function replayRisicoUiToWebContents(wc: WebContents): void {
 
   const snap = getRisicoRunSnapshot()
   if (!snap.running || !snap.aanbestedingId) return
+
+  // Replay draft snapshot als die beschikbaar is
+  const lastDraft = lastDraftByTender.get(snap.aanbestedingId)
+  if (lastDraft) {
+    wc.send(IPC.RISICO_DRAFT_SNAPSHOT, lastDraft)
+  }
 
   const last = lastByTender.get(snap.aanbestedingId)
   if (last && last.percentage < 100) {

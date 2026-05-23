@@ -19,6 +19,7 @@ import {
 import type { StoredDocumentEntry, TenderProcedureContext } from '../../shared/types'
 import { isZipDocumentEntryLike } from '../../shared/document-entry'
 import { buildMinimalProcedureContext, buildTenderProcedureContextFromTnsApi } from './procedure-context'
+import { keepWebContentsActiveForBackgroundWork } from '../utils/keep-webcontents-active'
 
 export type DocumentInfo = StoredDocumentEntry
 
@@ -160,6 +161,7 @@ const TAB_SCRAPE_TIMING_TENDERNED: TabScrapeTiming = {
 
 /** Voorkom oneindig hangen op loadURL / executeJavaScript (login, netwerk, SPA). */
 const PAGE_LOAD_TIMEOUT_MS = 55_000
+/** Ruime limiet: volledige tab-rondes op zware SPA’s mogen niet worden afgekapt — liever wachten dan tabbladen/documentlinks overslaan. */
 const TAB_SCRIPT_TIMEOUT_MS = 150_000
 /** Max wachten op Mercell native export-download(s) na tab-scrape. */
 const MERCELL_NATIVE_DOWNLOAD_WAIT_MS = 110_000
@@ -558,7 +560,8 @@ export async function fetchBronPaginaDetails(
           : 'TenderNed: browservenster starten…',
         percentage: 3,
       })
-      // Altijd tab-scrape in de browser (Details, Publicatie, Documenten, V&A); TNS-API parallel voor snellere/betrouwbare document-URLs + merge.
+      // Altijd: openbare TNS-API én volledige browser-tab-scrape (alle tabbladen) parallel —
+      // geen verkorte route: Q&A, Mercell-verwijzingen en alleen-in-UI zichtbare documentlinks blijven meegenomen.
       const tnsPromise = id ? fetchTenderNedFromTnsApi(id) : Promise.resolve(null)
       void tnsPromise
         .then(() => {
@@ -575,7 +578,7 @@ export async function fetchBronPaginaDetails(
         4800,
         TAB_SCRAPE_TIMING_TENDERNED,
         op,
-        tenderIdOpt
+        tenderIdOpt,
       )
       const [tns, browserTabs] = await Promise.all([tnsPromise, browserPromise])
       op?.({
@@ -1131,9 +1134,13 @@ async function fetchTenderPageWithTabs(
   initialWaitMs: number,
   tabTiming: TabScrapeTiming = TAB_SCRAPE_TIMING_FAST,
   onProgress?: BronFetchOnProgress,
-  tenderId?: string
+  tenderId?: string,
 ): Promise<BronPaginaDetails> {
-  log.info(`fetchTenderPageWithTabs: ${loadUrl} (tabs: ${tabLabels.join(', ')})`)
+  log.info(
+    `fetchTenderPageWithTabs: ${loadUrl} (tabs: ${tabLabels.join(', ')}; script-timeout ${Math.round(
+      TAB_SCRIPT_TIMEOUT_MS / 1000,
+    )}s)`,
+  )
 
   const nativeDownloadDocs: DocumentInfo[] = []
   const pendingDownloadPromises: Promise<void>[] = []
@@ -1150,6 +1157,7 @@ async function fetchTenderPageWithTabs(
       ...(partition ? { partition } : {}),
     },
   })
+  keepWebContentsActiveForBackgroundWork(win)
 
   const tid = tenderId?.trim()
   if (tid && isMercellHostHint(loadUrl)) {
@@ -1331,8 +1339,8 @@ async function fetchTenderPageWithTabs(
     const tabHint = tabLabels.slice(0, 6).join(' · ')
     onProgress?.({
       step: `Tabbladen doorlopen (${tabHint || 'documenten'}) — kan tot ~${Math.ceil(
-        TAB_SCRIPT_TIMEOUT_MS / 60000
-      )} min duren bij trage bron…`,
+        TAB_SCRIPT_TIMEOUT_MS / 60000,
+      )} min duren bij trage bron (volledige inhoud, niets overslaan)…`,
       percentage: 7,
     })
     const script = buildTabScrapeScript(JSON.stringify(tabLabels), tabTiming)
@@ -1341,7 +1349,7 @@ async function fetchTenderPageWithTabs(
       result = (await raceTimeout(
         win.webContents.executeJavaScript(script),
         TAB_SCRIPT_TIMEOUT_MS,
-        'Tab-tracking (executeJavaScript)'
+        'Tab-tracking (executeJavaScript)',
       )) as BronPaginaDetails | null
     } catch (scriptErr: unknown) {
       const msg = scriptErr instanceof Error ? scriptErr.message : String(scriptErr)

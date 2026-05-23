@@ -1,5 +1,9 @@
 @import "tailwindcss";
 
+/* Force class-based dark mode: dark: variants only apply when .dark is present on an ancestor.
+   Since this app is always light mode (color-scheme: light), dark: classes never activate. */
+@custom-variant dark (&:where(.dark, .dark *));
+
 @keyframes deadline-blink {
   0%, 49% { opacity: 1; }
   50%, 100% { opacity: 0; }
@@ -15,25 +19,25 @@
   }
 
   :root {
-    --background: oklch(1 0 0);
-    --foreground: oklch(0 0 0);
+    --background: oklch(0.99 0 0);
+    --foreground: oklch(0.10 0.01 250);
     --card: oklch(1 0 0);
-    --card-foreground: oklch(0 0 0);
+    --card-foreground: oklch(0.10 0.01 250);
     --popover: oklch(1 0 0);
-    --popover-foreground: oklch(0 0 0);
-    --primary: oklch(0.35 0.08 240);
+    --popover-foreground: oklch(0.10 0.01 250);
+    --primary: oklch(0.35 0.10 245);
     --primary-foreground: oklch(0.985 0 0);
-    --secondary: oklch(0.95 0.01 240);
-    --secondary-foreground: oklch(0 0 0);
-    --muted: oklch(0.95 0.01 240);
-    --muted-foreground: oklch(0.40 0.02 260);
-    --accent: oklch(0.92 0.04 150);
-    --accent-foreground: oklch(0 0 0);
-    --destructive: oklch(0.55 0.2 25);
+    --secondary: oklch(0.95 0.01 245);
+    --secondary-foreground: oklch(0.10 0.01 250);
+    --muted: oklch(0.96 0.005 245);
+    --muted-foreground: oklch(0.38 0.025 255);
+    --accent: oklch(0.94 0.03 230);
+    --accent-foreground: oklch(0.10 0.01 250);
+    --destructive: oklch(0.55 0.20 25);
     --destructive-foreground: oklch(0.985 0 0);
-    --border: oklch(0.88 0.01 240);
-    --input: oklch(0.88 0.01 240);
-    --ring: oklch(0.35 0.08 240);
+    --border: oklch(0.90 0.008 245);
+    --input: oklch(0.90 0.008 245);
+    --ring: oklch(0.35 0.10 245);
     --radius: 0.625rem;
     --sidebar-background: oklch(0.16 0.03 240);
     --sidebar-foreground: oklch(0.92 0.01 240);
@@ -43,11 +47,11 @@
     --sidebar-accent-foreground: oklch(0.92 0.01 240);
     --sidebar-border: oklch(0.28 0.03 240);
     --sidebar-ring: oklch(0.75 0.12 160);
-    --success: oklch(0.55 0.18 145);
-    --warning: oklch(0.65 0.15 75);
-    --score-high: oklch(0.55 0.18 145);
-    --score-medium: oklch(0.65 0.15 75);
-    --score-low: oklch(0.55 0.2 25);
+    --success: oklch(0.52 0.16 148);
+    --warning: oklch(0.60 0.13 78);
+    --score-high: oklch(0.52 0.16 148);
+    --score-medium: oklch(0.60 0.13 78);
+    --score-low: oklch(0.52 0.20 25);
   }
 
   /* ── Dark mode ── */
@@ -138,8 +142,152 @@
   -webkit-app-region: no-drag;
 }
 
+/* ── Print / PDF ─────────────────────────────────────────────────────────── */
+@media print {
+  /* Force colour printing */
+  * {
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+
+  /*
+   * Toon alleen .risico-print-root (zit in #root): visibility-truc omdat
+   * body > *:not(.risico-print-root) het #root verbergt en een lege PDF gaf.
+   */
+  body * {
+    visibility: hidden;
+  }
+  .risico-print-root,
+  .risico-print-root * {
+    visibility: visible;
+  }
+  .risico-print-root .risico-print-hide,
+  .risico-print-root .risico-print-hide * {
+    visibility: hidden !important;
+    display: none !important;
+  }
+
+  .risico-print-root {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+  }
+
+  /* Hide interactive UI elements inside the report */
+  .risico-print-hide {
+    display: none !important;
+  }
+
+  /* Verborgen klap-secties volledig tonen (overschrijft Tailwind .hidden) */
+  .risico-print-root [data-risico-body] {
+    display: block !important;
+  }
+  .risico-print-root .risico-collapsed-preview,
+  .risico-print-root .risico-collapsed-preview * {
+    display: none !important;
+    visibility: hidden !important;
+  }
+
+  /* Line-clamp in PDF: volledige teksten */
+  .risico-print-root [class*="line-clamp"] {
+    -webkit-line-clamp: unset !important;
+    line-clamp: unset !important;
+    overflow: visible !important;
+    display: block !important;
+    max-height: none !important;
+  }
+
+  /* Remove scroll containers so full content renders */
+  html, body, #root, [data-scrollable], .overflow-auto, .overflow-y-auto, .overflow-hidden {
+    overflow: visible !important;
+    height: auto !important;
+    max-height: none !important;
+  }
+
+  /* Clean page layout */
+  .risico-report {
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+
+  /* Inhoudsopgave: niet sticky op papier */
+  #s-nav-toc {
+    position: static !important;
+    box-shadow: none !important;
+    page-break-after: avoid;
+  }
+
+  /* Cards look clean in print */
+  .risico-report [class*="rounded"] {
+    border-radius: 6px !important;
+  }
+
+  /* Page breaks before major sections */
+  #s-risicogebieden,
+  #s-nvi,
+  #s-strategie,
+  #s-overzicht {
+    page-break-before: always;
+  }
+
+  /* Avoid orphan cards */
+  #s-top5 > *,
+  #s-nogo > * {
+    page-break-inside: avoid;
+  }
+}
+
+/* Scroll-margin voor anchor-navigatie vanuit TOC (ruimte voor sticky inhoudsopgave) */
+.risico-report [id^="s-"]:not(#s-nav-toc) {
+  scroll-margin-top: min(12rem, 28vh);
+}
+
+/* Document-hervat-banner: dwing leesbaar zwart in light mode (niet de hele card — knoppen houden eigen kleur) */
+.doc-resume-banner-copy h3,
+.doc-resume-banner-copy p,
+.doc-resume-banner-copy li,
+.doc-resume-banner-copy strong {
+  color: #0a0a0a !important;
+}
+.dark .doc-resume-banner-copy h3,
+.dark .doc-resume-banner-copy p,
+.dark .doc-resume-banner-copy li,
+.dark .doc-resume-banner-copy strong {
+  color: #fde68a !important; /* amber-200 */
+}
+
 /* Document previews altijd in licht kleurenschema — originele kleuren behouden */
 .doc-preview-light {
   color-scheme: light;
   background: white;
+}
+
+/* Kaart: SVG-driehoekmarkers zonder standaard Leaflet-div-achtergrond */
+.leaflet-div-icon.tender-map-triangle-icon {
+  background: transparent !important;
+  border: none !important;
+}
+
+.tender-map-triangle-wrap {
+  transform-origin: 50% 100%;
+  line-height: 0;
+}
+
+/* Geselecteerd (o.a. via rechtermenu): langzame, herhaalde bounce = actieve aanbesteding */
+.tender-map-triangle-wrap--selected {
+  animation: tender-map-marker-bounce-slow 2.75s ease-in-out infinite;
+}
+
+@keyframes tender-map-marker-bounce-slow {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  33% {
+    transform: translateY(-5px);
+  }
+  66% {
+    transform: translateY(-2px);
+  }
 }

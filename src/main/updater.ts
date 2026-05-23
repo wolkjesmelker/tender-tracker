@@ -2,6 +2,7 @@ import { app, BrowserWindow } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import log from 'electron-log'
 import { IPC } from '../shared/constants'
+import { applyRolloutFeedUrlSerialized } from './release-rollout-service'
 
 export function setupAutoUpdater(getWindow: () => BrowserWindow | null): void {
   if (!app.isPackaged) {
@@ -35,14 +36,13 @@ export function setupAutoUpdater(getWindow: () => BrowserWindow | null): void {
     log.warn('[updater]', err)
   })
 
-  // Check 10 seconden na opstart, daarna elk uur
-  setTimeout(() => {
-    void autoUpdater.checkForUpdates().catch((e) => log.warn('[updater] checkForUpdates', e))
-  }, 10_000)
+  const runCheck = () =>
+    applyRolloutFeedUrlSerialized()
+      .then(() => autoUpdater.checkForUpdates())
+      .catch((e) => log.warn('[updater] checkForUpdates', e))
 
-  setInterval(() => {
-    void autoUpdater.checkForUpdates().catch((e) => log.warn('[updater] checkForUpdates (interval)', e))
-  }, 60 * 60 * 1_000)
+  setTimeout(runCheck, 10_000)
+  setInterval(runCheck, 60 * 60 * 1_000)
 }
 
 export async function checkForUpdatesManual(): Promise<{
@@ -50,6 +50,7 @@ export async function checkForUpdatesManual(): Promise<{
   updateInfo?: unknown
 } | null> {
   if (!app.isPackaged) return null
+  await applyRolloutFeedUrlSerialized()
   const r = await autoUpdater.checkForUpdates()
   if (!r) return null
   return {

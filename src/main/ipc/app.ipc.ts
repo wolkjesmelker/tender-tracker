@@ -8,6 +8,7 @@ import {
   downloadUpdateNow,
   quitAndInstallNow,
 } from '../updater'
+import { applyRolloutFeedUrlSerialized } from '../release-rollout-service'
 
 let cachedLicense: LicenseStatus = { ok: true, skipped: true }
 
@@ -26,12 +27,15 @@ export function registerAppHandlers(): void {
     return s
   })
 
-  ipcMain.handle(IPC.APP_CHECK_UPDATES, async () => {
+  ipcMain.handle(IPC.APP_CHECK_UPDATES, async (event) => {
     if (!app.isPackaged) {
       return { ok: true as const, isUpdateAvailable: false }
     }
     try {
       const r = await checkForUpdatesManual()
+      if (r?.isUpdateAvailable && r?.updateInfo) {
+        event.sender.send(IPC.APP_UPDATE_AVAILABLE, r.updateInfo)
+      }
       return {
         ok: true as const,
         isUpdateAvailable: r?.isUpdateAvailable ?? false,
@@ -48,6 +52,7 @@ export function registerAppHandlers(): void {
 
   ipcMain.handle(IPC.APP_DOWNLOAD_UPDATE, async () => {
     if (!app.isPackaged) return { ok: false as const }
+    await applyRolloutFeedUrlSerialized()
     await downloadUpdateNow()
     return { ok: true as const }
   })

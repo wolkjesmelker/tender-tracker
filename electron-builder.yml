@@ -19,12 +19,13 @@ npmRebuild: false
 afterPack: scripts/after-pack.js
 
 # ── Auto-update ──────────────────────────────────────────────────────────────
-# Upload de inhoud van ./release handmatig naar deze URL na het bouwen.
-# Of gebruik: npm run release:publish (vereist schrijftoegang tot de server)
-# Zie RELEASE.md voor de volledige workflow.
+# Publiceren naar GitHub Releases: push een versie-tag (v*.*.*) om de
+# GitHub Actions workflow te triggeren. Die bouwt en publiceert automatisch.
+# Lokaal: npm run release:patch | release:minor | release:major
 publish:
-  provider: generic
-  url: https://releases.questric.eu/tendertracker/
+  provider: github
+  owner: wolkjesmelker
+  repo: tender-tracker
 
 # ── macOS ────────────────────────────────────────────────────────────────────
 mac:
@@ -44,7 +45,8 @@ mac:
   gatekeeperAssess: false
 
 dmg:
-  title: "TenderTracker ${version}"
+  # Geen spatie in schijfnaam: hdiutil create faalt anders (EPERM op /Volumes/…/TenderTracker.app).
+  title: "${productName}-v${version}"
   background: resources/dmg-background.png
   icon: resources/icon.icns
   iconSize: 80
@@ -71,6 +73,9 @@ win:
   legalTrademarks: "TenderTracker is een handelsmerk van Questric"
 
 nsis:
+  # Data staat buiten de installatiemap (o.a. %APPDATA%/tender-tracker); nooit automatisch wissen
+  # bij deïnstallatie of na een update — gebruikers behouden DB en bijlagen.
+  deleteAppDataOnUninstall: false
   oneClick: false
   allowToChangeInstallationDirectory: true
   installerIcon: resources/icon.ico

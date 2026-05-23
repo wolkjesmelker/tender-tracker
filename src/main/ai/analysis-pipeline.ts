@@ -2045,6 +2045,401 @@ function splitDocumentsIntoChunks(documentTexts: string[], maxChunkChars: number
   return chunks.length > 0 ? chunks : [documentTexts]
 }
 
+function parseStoredCriteriaScoresFromTender(
+  raw: string | null | undefined,
+  criteriaRows: CriteriaRow[],
+): Record<string, NormalizedCriterionDetail> {
+  if (!raw?.trim()) return {}
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return {}
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+  const byId = new Map(criteriaRows.map((c) => [c.id, c]))
+  const out: Record<string, NormalizedCriterionDetail> = {}
+  for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+    const id = k.trim()
+    if (!byId.has(id)) continue
+    const row = byId.get(id)!
+    if (typeof v === 'number' && Number.isFinite(v)) {
+      let score = Math.max(-100, Math.min(100, v))
+      const status = score >= 75 ? 'match' : score >= 25 ? 'gedeeltelijk' : score < 0 ? 'risico' : 'niet_aanwezig'
+      out[id] = { score, status, toelichting: '', brontekst: '', criterium_naam: row.naam }
+      continue
+    }
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const o = v as Record<string, unknown>
+      let score = Number(o.score)
+      if (!Number.isFinite(score)) score = 0
+      score = Math.max(-100, Math.min(100, score))
+      const status = score >= 75 ? 'match' : score >= 25 ? 'gedeeltelijk' : score < 0 ? 'risico' : 'niet_aanwezig'
+      out[id] = {
+        score,
+        status,
+        toelichting: typeof o.toelichting === 'string' ? o.toelichting : '',
+        brontekst: typeof o.brontekst === 'string' ? o.brontekst : '',
+        criterium_naam: typeof o.criterium_naam === 'string' ? o.criterium_naam : row.naam,
+      }
+    }
+  }
+  return out
+}
+
+function computeTotaalScoreFromNormalizedCriteria(
+  criteriaNormalized: Record<string, NormalizedCriterionDetail> | null,
+): number {
+  if (!criteriaNormalized || Object.keys(criteriaNormalized).length === 0) return 0
+  let totaalScore = 0
+  let hasMatch = false
+  let hasPartial = false
+  let risicoAftrek = 0
+  for (const detail of Object.values(criteriaNormalized)) {
+    const score = detail.score ?? 0
+    const status = detail.status
+    if (status === 'match' || score >= 75) hasMatch = true
+    else if (status === 'gedeeltelijk' || (score >= 25 && score < 75)) hasPartial = true
+    else if (status === 'risico' || score < 0) risicoAftrek += Math.abs(score / 50) * 10
+  }
+  if (hasMatch) totaalScore = hasPartial ? 90 : 85
+  else if (hasPartial) totaalScore = 55
+  else totaalScore = 20
+  totaalScore = Math.max(0, Math.min(100, totaalScore - risicoAftrek))
+  const scoreVals = Object.values(criteriaNormalized)
+    .map((d) => d.score)
+    .filter((s) => Number.isFinite(s)) as number[]
+  if (scoreVals.length > 0) {
+    const avgCrit = scoreVals.reduce((a, b) => a + b, 0) / scoreVals.length
+    totaalScore = Math.max(0, Math.min(100, Math.round(0.38 * totaalScore + 0.62 * avgCrit)))
+  }
+  return totaalScore
+}
+
+function normalizedCriteriaToDbScores(
+  m: Record<string, NormalizedCriterionDetail>,
+): Record<string, { score: number; status: string; toelichting: string; brontekst: string; criterium_naam?: string }> {
+  const o: Record<string, { score: number; status: string; toelichting: string; brontekst: string; criterium_naam?: string }> =
+    {}
+  for (const [id, d] of Object.entries(m)) {
+    o[id] = {
+      score: d.score,
+      status: d.status,
+      toelichting: d.toelichting,
+      brontekst: d.brontekst,
+      ...(d.criterium_naam ? { criterium_naam: d.criterium_naam } : {}),
+    }
+  }
+  return o
+}
+
+/** Grote enkele bijlage splitsen in meerdere slices met herkenbare BIJLAGE-headers (criteria-chunks). */
+function splitLargeBijlageIntoDocSlices(naam: string, body: string, maxChars: number): string[] {
+  const headerBase = naam.trim() || 'handmatige-bijlage'
+  if (body.length <= maxChars) {
+    return [`\n--- BIJLAGE: ${headerBase} ---\n${body}`]
+  }
+  const slices: string[] = []
+  for (let i = 0, part = 1; i < body.length; i += maxChars, part++) {
+    const chunk = body.slice(i, i + maxChars)
+    slices.push(`\n--- BIJLAGE: ${headerBase} (deel ${part}) ---\n${chunk}`)
+  }
+  return slices
+}
+
+async function runIncrementalSummaryRefresh(args: {
+  settings: Record<string, string>
+  agentPrompt: string
+  tender: any
+  bestaandeSamenvatting: string
+  bestaandeMatchUitleg: string
+  nieuweBijlagenJson: string
+  scoreWijzigingen: { id: string; naam: string; oude: number; nieuwe: number }[]
+}): Promise<{ samenvatting: string; match_uitleg: string } | null> {
+  const { settings, agentPrompt, tender, bestaandeSamenvatting, bestaandeMatchUitleg, nieuweBijlagenJson, scoreWijzigingen } =
+    args
+  const prov = settings.ai_provider || 'claude'
+  const preferJsonOutput =
+    prov === 'ollama' || prov === 'openai' || prov === 'moonshot' || prov === 'kimi_cli'
+  const user = `Je werkt een bestaande aanbestedingsanalyse bij: de gebruiker heeft handmatig extra documenten toegevoegd.
+Pas samenvatting en match_uitleg aan zodat ze de nieuwe informatie verwerken. Houd toon en precisie aan (Nederlands).
+
+Titel: ${String(tender.titel || '')}
+
+Bestaande samenvatting:
+${bestaandeSamenvatting.slice(0, 12_000)}
+
+Bestaande match_uitleg:
+${bestaandeMatchUitleg.slice(0, 8000)}
+
+Nieuwe per-bijlage analyses (JSON, compact):
+${nieuweBijlagenJson.slice(0, 12_000)}
+
+Criteria met hogere score na lezen van de nieuwe documenten (id, naam, oude → nieuwe):
+${scoreWijzigingen.length ? JSON.stringify(scoreWijzigingen) : '(geen hogere scores — alleen bijlage/summary bijwerken indien zinvol)'}
+
+Geef ALLEEN geldige JSON, geen markdown, met exact deze sleutels:
+"samenvatting" (max. ~300 woorden, synthese),
+"match_uitleg" (min. ~100 woorden; wat de nieuwe documenten toevoegen voor het inschrijfbeeld).
+Corrigeer eerdere conclusies als het nieuwe document dat rechtvaardigt.`
+
+  try {
+    const response = await aiService.chat(
+      [{ role: 'system', content: agentPrompt }, { role: 'user', content: user }],
+      { preferJsonOutput },
+    )
+    const { parsed } = parseAnalysisJsonResponse(response)
+    if (!parsed || typeof parsed.samenvatting !== 'string' || !parsed.samenvatting.trim()) return null
+    return {
+      samenvatting: parsed.samenvatting.trim(),
+      match_uitleg:
+        typeof parsed.match_uitleg === 'string' && parsed.match_uitleg.trim()
+          ? parsed.match_uitleg.trim()
+          : bestaandeMatchUitleg,
+    }
+  } catch (e: any) {
+    log.warn('[analysis] Incrementele samenvatting-merge mislukt:', e?.message || e)
+    return null
+  }
+}
+
+/**
+ * Alleen nieuw toegevoegde lokale bestanden: criteria-chunks (zelfde merge als volledige analyse: hoogste score wint),
+ * per-bijlage-LLM voor die bestanden, samenvatting/match_uitleg bijwerken. Geen bron-fetch, geen bestaande documenten opnieuw.
+ */
+export async function runIncrementalAnalysisForManualDocuments(
+  tender: any,
+  newLocalNames: string[],
+  criteria: any[],
+  prompts: any[],
+  settings: Record<string, string>,
+  onProgress: ProgressCallback,
+): Promise<AnalysisResult> {
+  acquireBusyWorkBlocker('incremental-ai-analysis')
+  try {
+    aiService.configure(settings)
+    const agentApp = 'App · aanvullende analyse'
+    const agentLlm = aiService.getConfiguredAgentLabel()
+    const report = (step: string, percentage: number, mode: 'app' | 'llm') => {
+      onProgress({ step, percentage, agent: mode === 'app' ? agentApp : agentLlm })
+    }
+
+    const isAvailable = await aiService.isAvailable()
+    if (!isAvailable) {
+      throw new Error('AI service is niet beschikbaar. Controleer je API-sleutel en instellingen.')
+    }
+
+    const names = [...new Set(newLocalNames.map((n) => String(n || '').trim()).filter(Boolean))]
+    if (!names.length) {
+      throw new Error('Geen bestandsnamen voor aanvullende analyse.')
+    }
+
+    const agentPrompt = prompts.find((p) => p.type === 'agent')?.prompt_tekst || ''
+    const scorerPrompt = prompts.find((p) => p.type === 'scorer')?.prompt_tekst || ''
+    const portalBronHint = inferPortalBronFromBronUrl(String(tender.bron_url || ''))
+
+    const critRows: CriteriaRow[] = criteria
+      .map((c: any) => ({ id: String(c.id || ''), naam: String(c.naam || '') }))
+      .filter((c) => c.id.length > 0)
+
+    let antwoorden: Record<string, string> = {}
+    try {
+      if (tender.ai_antwoorden?.trim()) {
+        const p = JSON.parse(tender.ai_antwoorden)
+        if (p && typeof p === 'object' && !Array.isArray(p)) antwoorden = p as Record<string, string>
+      }
+    } catch {
+      antwoorden = {}
+    }
+
+    let bestaandeBijlagen: BijlageAnalyse[] = []
+    try {
+      if (tender.bijlage_analyses?.trim()) {
+        const p = JSON.parse(tender.bijlage_analyses)
+        if (Array.isArray(p)) bestaandeBijlagen = p as BijlageAnalyse[]
+      }
+    } catch {
+      bestaandeBijlagen = []
+    }
+
+    let tenderVelden: AiExtractedTenderFields | undefined
+    try {
+      if (tender.ai_extracted_fields?.trim()) {
+        tenderVelden = JSON.parse(tender.ai_extracted_fields) as AiExtractedTenderFields
+      }
+    } catch {
+      tenderVelden = undefined
+    }
+
+    const bestaandeSamenvatting = String(tender.ai_samenvatting || '').trim()
+    const bestaandeMatchUitleg = String(tender.match_uitleg || '').trim()
+
+    const preExisting = parseStoredCriteriaScoresFromTender(tender.criteria_scores, critRows)
+
+    report(`Nieuwe bijlage(n) lezen (${names.length})…`, 8, 'app')
+    const newDocumentTexts: string[] = []
+    for (const localNaam of names) {
+      const text = await readLocalDocumentAndExtractText(String(tender.id), localNaam, localNaam)
+      if (text && text.length > 20) {
+        newDocumentTexts.push(...splitLargeBijlageIntoDocSlices(localNaam, text, DOCS_CHUNK_CHARS))
+      } else {
+        newDocumentTexts.push(
+          `\n--- BIJLAGE: ${localNaam} ---\n[Geen leesbare tekst: extractie mislukt of document te kort.]\n`,
+        )
+      }
+    }
+
+    let mergedCriteria: Record<string, NormalizedCriterionDetail> = { ...preExisting }
+
+    const hasReadableChunk = newDocumentTexts.some((t) => {
+      const h = extractBijlageHeaderFromSlice(t)
+      if (!h) return t.length > 120
+      return !isUnreadablePlaceholderBijlageBody(h.body)
+    })
+
+    if (critRows.length > 0 && hasReadableChunk) {
+      const docChunks = splitDocumentsIntoChunks(newDocumentTexts, DOCS_CHUNK_CHARS)
+      log.info(`[analysis] Incrementeel: ${newDocumentTexts.length} slice(s) → ${docChunks.length} criteria-chunk(s)`)
+      report(`Criteria beoordelen op nieuwe documenten (${docChunks.length} deel(en))…`, 22, 'llm')
+
+      await runWithPeriodicLlmProgress(
+        report,
+        22,
+        48,
+        (sec) => `Criteria op nieuwe documenten — bezig (${sec}s)…`,
+        async () => {
+          for (let batchStart = 0; batchStart < docChunks.length; batchStart += LLM_CHUNK_EXTRACTION_CONCURRENCY) {
+            const batchEnd = Math.min(batchStart + LLM_CHUNK_EXTRACTION_CONCURRENCY, docChunks.length)
+            const indices: number[] = []
+            for (let i = batchStart; i < batchEnd; i++) indices.push(i)
+            await Promise.all(
+              indices.map(async (ci) => {
+                const chunk = docChunks[ci]
+                const chunkResult = await runCriteriaChunkAnalysis(
+                  chunk,
+                  ci,
+                  docChunks.length,
+                  tender,
+                  criteria,
+                  settings,
+                  agentPrompt,
+                  scorerPrompt,
+                )
+                if (!chunkResult) return
+                for (const [id, detail] of Object.entries(chunkResult)) {
+                  const ex = mergedCriteria[id]
+                  if (!ex || detail.score > ex.score) mergedCriteria[id] = detail
+                }
+              }),
+            )
+          }
+        },
+      )
+    }
+
+    const criteriaScoresForDb = normalizedCriteriaToDbScores(mergedCriteria) as unknown as AnalysisResult['criteria_scores']
+    const totaalScore = computeTotaalScoreFromNormalizedCriteria(mergedCriteria)
+    const relevantieScore = totaalScore
+
+    report('Per-bijlage: nieuwe bestanden…', 55, 'llm')
+    const perBijlageOutcome = await runPerBijlageAnalysisPasses({
+      tenderId: String(tender.id),
+      tender,
+      documentTexts: newDocumentTexts,
+      portalBronHint,
+      settings,
+      report,
+      poll: () => {
+        const p = analysisControlPoll(String(tender.id))
+        if (p === 'stop') return 'stop'
+        if (p === 'pause') return 'pause'
+        return null
+      },
+    })
+
+    if (!perBijlageOutcome.ok) {
+      throw new Error(perBijlageOutcome.outcome === 'stopped' ? 'Analyse gestopt.' : 'Analyse gepauzeerd.')
+    }
+
+    const nieuweAnalyses = perBijlageOutcome.analyses
+    const mergedBijlagen: BijlageAnalyse[] = []
+    for (const b of bestaandeBijlagen) {
+      if (b?.naam) mergedBijlagen.push(b)
+    }
+    for (const b of nieuweAnalyses) {
+      if (!b?.naam) continue
+      const k = normalizeBijlageNameKey(b.naam)
+      const idx = mergedBijlagen.findIndex((x) => normalizeBijlageNameKey(x.naam) === k)
+      if (idx >= 0) mergedBijlagen[idx] = b
+      else mergedBijlagen.push(b)
+    }
+
+    const scoreWijzigingen: { id: string; naam: string; oude: number; nieuwe: number }[] = []
+    for (const [id, nieuw] of Object.entries(mergedCriteria)) {
+      const oude = preExisting[id]
+      const oudeScore = oude?.score ?? 0
+      if (nieuw.score > oudeScore) {
+        scoreWijzigingen.push({
+          id,
+          naam: nieuw.criterium_naam || id,
+          oude: oudeScore,
+          nieuwe: nieuw.score,
+        })
+      }
+    }
+
+    report('Samenvatting en match_uitleg bijwerken…', 72, 'llm')
+    const nieuweBijlagenJson = JSON.stringify(
+      nieuweAnalyses.map((b) => ({
+        naam: b.naam,
+        samenvatting: b.samenvatting,
+        score: b.score,
+        belangrijkste_punten: b.belangrijkste_punten?.slice(0, 8),
+      })),
+    )
+
+    const refreshed = await withLlmWaitHeartbeats(report, () =>
+      runIncrementalSummaryRefresh({
+        settings,
+        agentPrompt,
+        tender,
+        bestaandeSamenvatting: bestaandeSamenvatting || '(geen eerdere samenvatting)',
+        bestaandeMatchUitleg: bestaandeMatchUitleg || '(geen eerdere match_uitleg)',
+        nieuweBijlagenJson,
+        scoreWijzigingen,
+      }),
+    )
+
+    let samenvatting = bestaandeSamenvatting
+    let matchUitleg = bestaandeMatchUitleg
+    if (refreshed) {
+      samenvatting = refreshed.samenvatting
+      matchUitleg = refreshed.match_uitleg
+    } else if (bestaandeSamenvatting) {
+      samenvatting =
+        bestaandeSamenvatting +
+        `\n\n— Aanvulling na handmatig toegevoegd(e) bestand(en): ${names.join(', ')}. Zie bijlage-analyses voor details.`
+    } else {
+      samenvatting = `Handmatig document(en) toegevoegd: ${names.join(', ')}. Zie bijlage-analyses voor inhoud.`
+    }
+
+    report('Aanvullende analyse voltooid', 100, 'llm')
+
+    return {
+      samenvatting,
+      antwoorden,
+      criteria_scores: criteriaScoresForDb,
+      totaal_score: totaalScore,
+      match_uitleg: matchUitleg,
+      relevantie_score: relevantieScore,
+      bijlage_analyses: mergedBijlagen,
+      tender_velden: tenderVelden,
+    }
+  } finally {
+    releaseBusyWorkBlocker('incremental-ai-analysis')
+  }
+}
+
 /**
  * Voert een criteria-only analyse uit op één documentchunk.
  * Geeft het genormaliseerde criteria-object terug, of null bij een fout.

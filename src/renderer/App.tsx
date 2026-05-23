@@ -12,11 +12,13 @@ import { AIQuestionsPage } from './pages/AIQuestionsPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { AiDiagnosticsPage } from './pages/AiDiagnosticsPage'
 import { TenderCalendarPage } from './pages/TenderCalendarPage'
+import { TenderMapPage } from './pages/TenderMapPage'
 import { PipelinePage } from './pages/PipelinePage'
 import { SplashScreen } from './components/layout/splash-screen'
 import { UpdateNotifier } from './components/layout/update-notifier'
 import { LicenseBlockedScreen } from './components/license-blocked-screen'
 import { DisclaimerModal, isDisclaimerAccepted } from './components/layout/DisclaimerModal'
+import { TenderUpdatesModal } from './components/tender-updates-modal'
 import { api, isElectron } from './lib/ipc-client'
 import { useScrapeSessionStore } from './stores/scrape-session-store'
 import { useAnalysisActiveStore } from './stores/analysis-active-store'
@@ -25,6 +27,11 @@ import { GlobalAiActivityOverlay } from './components/global-ai-activity-overlay
 import { DocumentFetchResumeBanner } from './components/document-fetch-resume-banner'
 import { AgentPanel } from './components/agent/AgentPanel'
 import { DocumentFillWizard } from './components/agent/DocumentFillWizard'
+import { FEATURE_DOCUMENT_FORM_FILL } from '../shared/feature-flags'
+import {
+  MAP_RADIUS_STORAGE_KEY,
+  MAP_SELECTED_PROFILE_STORAGE_KEY,
+} from '../shared/tender-work-area'
 import { useState, useEffect } from 'react'
 import type { LicenseStatus, ScrapeProgress } from '@shared/types'
 import { Loader2 } from 'lucide-react'
@@ -48,6 +55,8 @@ export default function App() {
     return !isDisclaimerAccepted()
   })
   const [license, setLicense] = useState<LicenseStatus | null>(null)
+  const [unreadUpdatesCount, setUnreadUpdatesCount] = useState(0)
+  const [updatesModalOpen, setUpdatesModalOpen] = useState(false)
 
   const finishSplash = () => {
     try {
@@ -67,6 +76,30 @@ export default function App() {
       return
     }
     void api.getLicenseStatus?.().then(setLicense)
+  }, [])
+
+  /** Spiegel kaart-werkgebied (localStorage) naar app_settings zodat main na scrape kan filteren. */
+  useEffect(() => {
+    if (!isElectron || !api.setSetting) return
+    try {
+      const km = localStorage.getItem(MAP_RADIUS_STORAGE_KEY)
+      const pid = localStorage.getItem(MAP_SELECTED_PROFILE_STORAGE_KEY)
+      void api.setSetting(MAP_RADIUS_STORAGE_KEY, km ?? '')
+      void api.setSetting(MAP_SELECTED_PROFILE_STORAGE_KEY, pid ?? '')
+    } catch {
+      /* ignore */
+    }
+  }, [])
+
+  // Laad initieel aantal ongelezen updates + luister op live pushes
+  useEffect(() => {
+    if (!isElectron) return
+    void (api as any).getTenderUpdatesCount?.().then((c: number) => setUnreadUpdatesCount(c ?? 0))
+    const unsub = (api as any).onTenderUpdatesNew?.((data: { count: number }) => {
+      setUnreadUpdatesCount(data.count)
+      setUpdatesModalOpen(true)
+    })
+    return () => unsub?.()
   }, [])
 
   useEffect(() => {
@@ -186,15 +219,21 @@ export default function App() {
     <div className="flex h-screen overflow-hidden bg-[var(--background)]">
       <AppSidebar open={sidebarOpen} onToggle={() => setSidebarOpen(!sidebarOpen)} />
       <div className="flex flex-1 flex-col overflow-hidden">
-        <Header onToggleSidebar={() => setSidebarOpen(!sidebarOpen)} />
+        <Header
+          onToggleSidebar={() => setSidebarOpen(!sidebarOpen)}
+          unreadUpdatesCount={unreadUpdatesCount}
+          onOpenUpdates={() => setUpdatesModalOpen(true)}
+        />
         <DocumentFetchResumeBanner />
         <UpdateNotifier />
-        <main className="flex-1 overflow-y-auto p-6">
+        <main className="flex min-h-0 flex-1 flex-col overflow-hidden p-6">
+          <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
           <Routes>
             <Route path="/" element={<DashboardPage />} />
             <Route path="/aanbestedingen" element={<TendersPage />} />
             <Route path="/aanbestedingen/:id" element={<TenderDetailPage />} />
             <Route path="/aanbestedingskalender" element={<TenderCalendarPage />} />
+            <Route path="/kaart" element={<TenderMapPage />} />
             <Route path="/tracking" element={<ScrapingPage />} />
             <Route path="/scrapen" element={<Navigate to="/tracking" replace />} />
             <Route path="/bronnen" element={<SourcesPage />} />
@@ -204,11 +243,19 @@ export default function App() {
             <Route path="/instellingen" element={<SettingsPage />} />
             <Route path="/ai-diagnose" element={<AiDiagnosticsPage />} />
           </Routes>
+          </div>
         </main>
         <Footer />
         <GlobalAiActivityOverlay />
-        <AgentPanel />
-        <DocumentFillWizard />
+        {/* <AgentPanel /> */}
+        {FEATURE_DOCUMENT_FORM_FILL ? <DocumentFillWizard /> : null}
+        {updatesModalOpen && (
+          <TenderUpdatesModal
+            unreadCount={unreadUpdatesCount}
+            onCountChange={setUnreadUpdatesCount}
+            onClose={() => setUpdatesModalOpen(false)}
+          />
+        )}
       </div>
     </div>
   )

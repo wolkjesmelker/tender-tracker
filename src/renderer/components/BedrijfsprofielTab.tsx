@@ -4,6 +4,7 @@ import {
 } from 'lucide-react'
 import { api } from '../lib/ipc-client'
 import type { BedrijfsProfiel } from '@shared/types'
+import { FEATURE_DOCUMENT_FORM_FILL } from '../../shared/feature-flags'
 
 const LEGE_PROFIEL: Omit<BedrijfsProfiel, 'id' | 'created_at' | 'updated_at'> = {
   naam: '',
@@ -360,9 +361,18 @@ export function BedrijfsprofielTab() {
               Bedrijfsprofielen
             </h3>
             <p className="mt-1 text-xs text-[var(--muted-foreground)] leading-relaxed max-w-xl">
-              Sla bedrijfsgegevens eenmalig op. Bij het invullen van aanbestedingsdocumenten kies je
-              welk bedrijf inschrijft en worden alle velden automatisch ingevuld.
-              Maak meerdere profielen aan voor dochterondernemingen.
+              {FEATURE_DOCUMENT_FORM_FILL ? (
+                <>
+                  Sla bedrijfsgegevens eenmalig op. Bij het invullen van aanbestedingsdocumenten kies je
+                  welk bedrijf inschrijft en worden alle velden automatisch ingevuld.
+                  Maak meerdere profielen aan voor dochterondernemingen.
+                </>
+              ) : (
+                <>
+                  Sla bedrijfsgegevens eenmalig op voor gebruik in het dossier (o.a. inschrijving en correspondentie).
+                  Maak meerdere profielen aan voor dochterondernemingen.
+                </>
+              )}
             </p>
           </div>
           {saved && (

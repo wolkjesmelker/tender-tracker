@@ -58,6 +58,7 @@ export function vacuumDatabaseCopyTo(destDbPath: string): void {
 
 /**
  * Map kopiëren: alleen nieuwe/gewijzigde bestanden (geen verwijderingen doorzetten).
+ * Geëxporteerd voor lokale snapshot-back-ups onder `local-backups/`.
  */
 export function copyTreeIncremental(srcRoot: string, destRoot: string): { filesCopied: number } {
   if (!fs.existsSync(srcRoot)) return { filesCopied: 0 }

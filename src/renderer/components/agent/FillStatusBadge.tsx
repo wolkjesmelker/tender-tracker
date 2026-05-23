@@ -12,6 +12,8 @@ interface Props {
   refreshKey?: number
   /** Of een download-knop getoond moet worden. */
   showExport?: boolean
+  /** Compacte variant: klein icoontje + (alleen bij user_started) percentage, geen label. */
+  compact?: boolean
 }
 
 /**
@@ -21,7 +23,7 @@ interface Props {
  * - complete     → groen checkmark "Volledig ingevuld"
  * - contradiction→ rood waarschuwing
  */
-export function FillStatusBadge({ tenderId, documentNaam, className, refreshKey, showExport }: Props) {
+export function FillStatusBadge({ tenderId, documentNaam, className, refreshKey, showExport, compact }: Props) {
   const [summary, setSummary] = useState<AgentDocumentFillSummary | null>(null)
   const [exporting, setExporting] = useState(false)
   const [exportDone, setExportDone] = useState(false)
@@ -47,7 +49,14 @@ export function FillStatusBadge({ tenderId, documentNaam, className, refreshKey,
     e.stopPropagation()
     setExporting(true)
     try {
-      await api.agentExportFilledDocument?.({ tenderId, documentNaam })
+      const res = (await api.agentExportFilledDocument?.({ tenderId, documentNaam, format: 'pdf' })) as {
+        ok?: boolean
+        error?: string
+      } | null
+      if (!res?.ok) {
+        window.alert(res?.error || 'PDF-export mislukt.')
+        return
+      }
       setExportDone(true)
       setTimeout(() => setExportDone(false), 3000)
     } finally {
@@ -55,12 +64,59 @@ export function FillStatusBadge({ tenderId, documentNaam, className, refreshKey,
     }
   }
 
-  // Geen data: toon niets
-  if (!summary || summary.total_fields === 0) return null
+  // Geen data: toon niets. Let op: sommige documenten hebben alleen een checklist
+  // (geen formuliervelden). Die tellen we toch mee.
+  if (!summary || (summary.total_fields === 0 && summary.checklist_total === 0)) return null
 
+  const checklistPct =
+    summary.checklist_total > 0
+      ? Math.round((summary.checklist_done / summary.checklist_total) * 100)
+      : 0
   const pct = summary.percentage
   const label = `${summary.filled_fields}/${summary.total_fields}`
+  // Alleen een percentage tonen zodra de gebruiker zelf iets heeft ingevuld
+  // óf minimaal één checklist-item heeft afgevinkt. AI-voorstellen alléén tellen
+  // niet mee als “begonnen”.
+  const started = summary.user_started || summary.checklist_done > 0
 
+  if (compact) {
+    const isComplete = summary.status === 'complete'
+    const hasContra = summary.status === 'contradiction'
+    const dotColor = hasContra
+      ? 'bg-red-500'
+      : isComplete && started
+      ? 'bg-green-500'
+      : started
+      ? 'bg-amber-500'
+      : 'bg-slate-300'
+    const title = hasContra
+      ? `${summary.contradictions} tegenstrijdigheid(en)`
+      : isComplete
+      ? 'Volledig ingevuld'
+      : started
+      ? `${pct}% velden · ${checklistPct}% checklist`
+      : 'Nog niet begonnen'
+    return (
+      <span
+        className={cn('inline-flex items-center gap-1 text-[10px]', className)}
+        title={title}
+      >
+        <span className={cn('inline-block h-2 w-2 rounded-full', dotColor)} />
+        {started && !isComplete && (
+          <span className="font-medium text-[var(--muted-foreground)]">
+            {summary.total_fields > 0 ? `${pct}%` : `${checklistPct}%`}
+          </span>
+        )}
+        {isComplete && <CheckCircle2 className="h-3 w-3 text-green-600" />}
+      </span>
+    )
+  }
+
+  const partialText = started
+    ? summary.total_fields > 0
+      ? `${label} · ${pct}%`
+      : `${summary.checklist_done}/${summary.checklist_total} verzameld`
+    : 'Invulbaar'
   const statusConfig = {
     not_started: {
       icon: <CircleDot className="h-3 w-3" />,
@@ -69,8 +125,10 @@ export function FillStatusBadge({ tenderId, documentNaam, className, refreshKey,
     },
     partial: {
       icon: <Clock className="h-3 w-3" />,
-      text: `${label} · ${pct}%`,
-      color: 'bg-amber-50 text-amber-800 border border-amber-200',
+      text: partialText,
+      color: started
+        ? 'bg-amber-50 text-amber-800 border border-amber-200'
+        : 'bg-blue-50 text-blue-700 border border-blue-200',
     },
     complete: {
       icon: <CheckCircle2 className="h-3 w-3 text-green-600" />,
@@ -79,7 +137,7 @@ export function FillStatusBadge({ tenderId, documentNaam, className, refreshKey,
     },
     contradiction: {
       icon: <AlertTriangle className="h-3 w-3 text-red-600" />,
-      text: `${label} · ⚠ Let op`,
+      text: started ? `${label} · ⚠ Let op` : 'Invulbaar',
       color: 'bg-red-50 text-red-800 border border-red-200',
     },
   }
@@ -110,7 +168,7 @@ export function FillStatusBadge({ tenderId, documentNaam, className, refreshKey,
           type="button"
           onClick={(e) => void handleExport(e)}
           disabled={exporting}
-          title="Ingevuld document opslaan als PDF"
+          title="Ingevuld brondocument (PDF-formulier) opslaan"
           className="inline-flex items-center gap-0.5 rounded-full border border-blue-200 bg-blue-50 px-1.5 py-0.5 text-[10px] font-medium text-blue-700 hover:bg-blue-100 disabled:opacity-50"
         >
           {exporting ? (

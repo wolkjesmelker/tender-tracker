@@ -5,11 +5,11 @@ import { api, isElectron } from '../lib/ipc-client'
 import { formatDate, getScoreColor, getStatusLabel, getStatusColor } from '../lib/utils'
 import {
   ArrowLeft, Brain, Download, ExternalLink, Building2, MapPin,
-  CalendarDays, FileText, AlertTriangle, CheckCircle2, Loader2,
+  CalendarDays, FileText, AlertTriangle, CheckCircle2, Loader2, ScrollText,
   CircleCheck, CircleMinus, CircleX, CircleDot, Info,
   File, FileSpreadsheet, FileImage, FileArchive, FileCode, Eye, Trash2,
   Pause, Square, Play, Sparkles, RefreshCw, ChevronDown,
-  ShieldAlert, Clock, ClipboardList, Search, ArrowUpDown,
+  ShieldAlert, Clock, ClipboardList, Search, ArrowUpDown, Plus, FileEdit, Zap,
 } from 'lucide-react'
 import { DeleteConfirmationModal } from '../components/delete-confirmation-modal'
 import { LocalDocumentPreviewModal } from '../components/local-document-preview-modal'
@@ -20,16 +20,86 @@ import { useThemeStore } from '../stores/theme-store'
 import { ProcedureOverviewCard } from '../components/procedure-timeline'
 import { RisicoTab } from '../components/RisicoTab'
 import { InschrijvingTab } from '../components/InschrijvingTab'
-import { isFillableDocumentName } from '../../shared/fillable-document'
+import { TenderSummaryModal } from '../components/tender-summary-modal'
+import { RisicoModelPickerModal } from '../components/risico-model-picker-modal'
+import { isFillableCatalogEntry } from '../../shared/fillable-document'
+import { FillStatusBadge } from '../components/agent/FillStatusBadge'
+import { useAgentStore } from '../stores/agent-store'
 import type {
+  AgentDocumentFillSummary,
   AiExtractedTenderFields,
   BijlageAnalyse,
   BronNavigatieLink,
   StoredDocumentEntry,
   TenderProcedureContext,
+  TenderSummaryExportPayload,
+  TenderUpdate,
 } from '../../shared/types'
 import { hideZipRowIfContentsExpanded } from '../../shared/document-entry'
 import { isFormulierBronNavLink } from '../../shared/bron-embed'
+import {
+  bronFileLinkStableKey,
+  catalogDocumentStableKey,
+  parseCatalogSelectedKeys,
+} from '../../shared/catalog-document-key'
+import { FEATURE_DOCUMENT_FORM_FILL } from '../../shared/feature-flags'
+
+/**
+ * JSON-objectkolommen (ai_antwoorden, criteria_scores): soms dubbel geëncodeerd na sync,
+ * of al een plat object na tussenlagen — anders blijft de UI leeg terwijl data wel in SQLite staat.
+ */
+function parseStoredJsonRecord(raw: unknown): Record<string, unknown> | null {
+  if (raw == null || raw === '') return null
+  let v: unknown = raw
+  if (typeof v === 'object' && !Array.isArray(v)) return v as Record<string, unknown>
+  if (typeof v !== 'string') return null
+  const s0 = v.trim()
+  if (!s0) return null
+  try {
+    v = JSON.parse(s0)
+  } catch {
+    return null
+  }
+  if (typeof v === 'string') {
+    const inner = v.trim()
+    if (
+      (inner.startsWith('{') && inner.endsWith('}')) ||
+      (inner.startsWith('[') && inner.endsWith(']'))
+    ) {
+      try {
+        v = JSON.parse(inner)
+      } catch {
+        return null
+      }
+    }
+  }
+  return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null
+}
+
+function parseStoredJsonArray(raw: unknown): unknown[] {
+  if (raw == null || raw === '') return []
+  let v: unknown = raw
+  if (Array.isArray(v)) return v
+  if (typeof v !== 'string') return []
+  const s0 = v.trim()
+  if (!s0) return []
+  try {
+    v = JSON.parse(s0)
+  } catch {
+    return []
+  }
+  if (typeof v === 'string') {
+    const inner = v.trim()
+    if (inner.startsWith('[')) {
+      try {
+        v = JSON.parse(inner)
+      } catch {
+        return []
+      }
+    }
+  }
+  return Array.isArray(v) ? v : []
+}
 
 function analysisCheckpointStageLabel(stage: string | null): string {
   if (!stage) return ''
@@ -37,6 +107,14 @@ function analysisCheckpointStageLabel(stage: string | null): string {
   if (stage === 'db_docs') return 'bijlagen verwerken'
   if (stage === 'ai') return 'AI-beoordeling'
   return stage
+}
+
+/** Voortgangsindicator: 0% navy-blauw → 100% groen. */
+function mainAnalyseProgressAccentColor(pct: number): string {
+  const t = Math.min(1, Math.max(0, pct / 100))
+  const from = { r: 0x1a, g: 0x3e, b: 0x5c }
+  const to = { r: 0x16, g: 0x80, b: 0x3d }
+  return `rgb(${Math.round(from.r + (to.r - from.r) * t)}, ${Math.round(from.g + (to.g - from.g) * t)}, ${Math.round(from.b + (to.b - from.b) * t)})`
 }
 
 /** Renders plain text with smart formatting: detects headings, bullets, numbered lists, and key-value pairs */
@@ -503,7 +581,40 @@ export function TenderDetailPage() {
   const [analysisError, setAnalysisError] = useState('')
   const [expandedCriteria, setExpandedCriteria] = useState<Set<string>>(new Set())
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
+  const [summaryModalOpen, setSummaryModalOpen] = useState(false)
+  const [risicoModelPickerOpen, setRisicoModelPickerOpen] = useState(false)
   const [deleteLoading, setDeleteLoading] = useState(false)
+  const [fillRefreshKey, setFillRefreshKey] = useState(0)
+  const wizardOpen = useAgentStore((s) => s.wizard.open)
+  const prevWizardOpenRef = useRef(wizardOpen)
+  useEffect(() => {
+    if (prevWizardOpenRef.current && !wizardOpen) {
+      setFillRefreshKey((k) => k + 1)
+    }
+    prevWizardOpenRef.current = wizardOpen
+  }, [wizardOpen])
+
+  const [fillSummariesByDoc, setFillSummariesByDoc] = useState<Map<string, AgentDocumentFillSummary>>(() => new Map())
+  useEffect(() => {
+    if (!FEATURE_DOCUMENT_FORM_FILL || !id) return
+    let cancelled = false
+    void (async () => {
+      try {
+        const rows = (await api.agentGetFillSummary?.({ tenderId: id })) as AgentDocumentFillSummary[] | null
+        if (cancelled) return
+        const m = new Map<string, AgentDocumentFillSummary>()
+        for (const r of rows || []) {
+          if (r.document_naam) m.set(r.document_naam, r)
+        }
+        setFillSummariesByDoc(m)
+      } catch {
+        if (!cancelled) setFillSummariesByDoc(new Map())
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [id, fillRefreshKey, tender?.updated_at, tender?.risico_analyse_at])
   const [localPreviewFile, setLocalPreviewFile] = useState<{ naam: string; size: number } | null>(null)
   /** Bron-URL uit document_urls — zelfde preview-modal als lokale bestanden */
   const [bronPreview, setBronPreview] = useState<{ url: string; naam: string } | null>(null)
@@ -519,6 +630,18 @@ export function TenderDetailPage() {
   const [docSearch, setDocSearch] = useState('')
   const [docSortBy, setDocSortBy] = useState<'naam' | 'type'>('naam')
   const [docTypeFilter, setDocTypeFilter] = useState<string | null>(null)
+  /** Alleen aangevinkte catalogus-/bronlinks tonen */
+  const [docSelectionFilter, setDocSelectionFilter] = useState<'all' | 'selected'>('all')
+  /** Catalogus in documentenpaneel: alles, alleen invuldocumenten, of alleen inlichtingsdocumenten (+ bronlinks) */
+  const [docCatalogWeergave, setDocCatalogWeergave] = useState<'all' | 'invul' | 'inlichting'>('all')
+  useEffect(() => {
+    if (!FEATURE_DOCUMENT_FORM_FILL && docCatalogWeergave === 'invul') {
+      setDocCatalogWeergave('all')
+    }
+  }, [docCatalogWeergave])
+  const [manualDocAdding, setManualDocAdding] = useState(false)
+  const [removeCatalogBusy, setRemoveCatalogBusy] = useState(false)
+  const [manualUploadHint, setManualUploadHint] = useState<string | null>(null)
   const [notities, setNotities] = useState('')
   const [notitiesSaved, setNotitiesSaved] = useState(false)
   const notitiesTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -536,6 +659,124 @@ export function TenderDetailPage() {
     singleQueuedIds: [] as string[],
   })
   const [liveAnalysisPct, setLiveAnalysisPct] = useState<number | null>(null)
+
+  // ── Nieuwe documenten: welke docs zijn nieuw na laatste scrape? ──
+  const [nieuweDocNamen, setNieuweDocNamen] = useState<Set<string>>(new Set())
+  const [tenderUpdateIds, setTenderUpdateIds] = useState<string[]>([])
+  const [filterNieuweDocs, setFilterNieuweDocs] = useState(false)
+
+  useEffect(() => {
+    if (!id || !isElectron) return
+    let cancelled = false
+    void (async () => {
+      try {
+        const updates = (await (api as any).getTenderUpdatesForTender?.(id)) as TenderUpdate[] | undefined
+        if (cancelled || !updates?.length) {
+          setNieuweDocNamen(new Set())
+          setTenderUpdateIds([])
+          return
+        }
+        const namen = new Set<string>()
+        const ids: string[] = []
+        for (const u of updates) {
+          ids.push(u.id)
+          if (u.nieuwe_document_namen) {
+            try {
+              const arr = JSON.parse(u.nieuwe_document_namen) as string[]
+              arr.forEach((n) => namen.add(n))
+            } catch { /* skip */ }
+          }
+        }
+        if (!cancelled) {
+          setNieuweDocNamen(namen)
+          setTenderUpdateIds(ids)
+        }
+      } catch { /* stil falen */ }
+    })()
+    return () => { cancelled = true }
+  }, [id, tender?.updated_at])
+
+  const toggleCatalogDocKey = useCallback(
+    async (key: string, checked: boolean) => {
+      if (!id) return
+      const raw = (tender as { document_catalog_selected_keys?: string } | null)?.document_catalog_selected_keys
+      const next = parseCatalogSelectedKeys(typeof raw === 'string' ? raw : undefined)
+      if (checked) next.add(key)
+      else next.delete(key)
+      await api.updateTender(id, { document_catalog_selected_keys: JSON.stringify([...next]) })
+      await refresh()
+    },
+    [id, tender, refresh],
+  )
+
+  const removeSelectedCatalogEntries = useCallback(
+    async (keys: string[]) => {
+      if (!id || keys.length === 0) return
+      const removeFn = (
+        api as {
+          removeTenderCatalogEntries?: (tid: string, k: string[]) => Promise<{
+            success?: boolean
+            error?: string
+          }>
+        }
+      ).removeTenderCatalogEntries
+      if (typeof removeFn !== 'function') return
+      if (
+        !window.confirm(
+          `Weet je zeker dat je ${keys.length} item(s) uit de documentenlijst wilt halen? Lokaal opgeslagen bestanden worden permanent gewist. Dit kan niet ongedaan worden gemaakt.`,
+        )
+      ) {
+        return
+      }
+      setRemoveCatalogBusy(true)
+      try {
+        const r = await removeFn(id, keys)
+        if (!r?.success) {
+          window.alert(r?.error || 'Verwijderen mislukt.')
+          return
+        }
+        await refresh()
+      } catch (e) {
+        window.alert(e instanceof Error ? e.message : 'Verwijderen mislukt.')
+      } finally {
+        setRemoveCatalogBusy(false)
+      }
+    },
+    [id, refresh],
+  )
+
+  const handleAddManualDocuments = useCallback(async () => {
+    if (!id || !isElectron) return
+    const addFn = (api as { addManualTenderDocuments?: (tenderId: string) => Promise<unknown> })
+      .addManualTenderDocuments
+    if (typeof addFn !== 'function') return
+    setManualDocAdding(true)
+    setManualUploadHint(null)
+    try {
+      const r = (await addFn(id)) as {
+        success?: boolean
+        cancelled?: boolean
+        error?: string
+        added?: string[]
+      }
+      if (r?.cancelled) return
+      if (!r?.success) {
+        setManualUploadHint(r?.error || 'Toevoegen mislukt.')
+        return
+      }
+      const n = r.added?.length ?? 0
+      setManualUploadHint(
+        n > 0
+          ? `${n} bestand(en) toegevoegd. Aanvullende AI-analyse start automatisch (alleen op deze bestanden); voortgang zie je bij de AI-analyse hierboven.`
+          : 'Klaar.',
+      )
+      await refresh()
+    } catch (e: unknown) {
+      setManualUploadHint(e instanceof Error ? e.message : 'Toevoegen mislukt.')
+    } finally {
+      setManualDocAdding(false)
+    }
+  }, [id, refresh])
 
   const refreshAnalysisCheckpoint = React.useCallback(async () => {
     const r = (await api.getAnalysisCheckpoint?.(id!)) as
@@ -714,10 +955,14 @@ export function TenderDetailPage() {
     tenderActive?.type === 'risico' &&
     analysisRuntime.risicoAanbestedingId === id &&
     !analyseEntry
+  const risicoTabBusy =
+    !!id &&
+    (tenderActive?.type === 'risico' ||
+      (analysisRuntime.risicoRunning && analysisRuntime.risicoAanbestedingId === id))
   const showMainAnalyseProgressBanner =
     !!id &&
     !analyzing &&
-    !risicoOnlyBusyHere &&
+    !risicoTabBusy &&
     (analyseEntry != null ||
       (analysisRuntime.batchRunning && analysisRuntime.currentId === id) ||
       (analysisRuntime.singleRunning && analysisRuntime.singleAnalysisId === id))
@@ -735,23 +980,49 @@ export function TenderDetailPage() {
       ? analysisRuntime.risicoQueuedIds.indexOf(id) + 1
       : null
 
-  const risicoTabBusy =
-    !!id &&
-    (tenderActive?.type === 'risico' ||
-      (analysisRuntime.risicoRunning && analysisRuntime.risicoAanbestedingId === id))
   const overzichtTabBusy = !!id && thisTenderMainAnalyseRunning
 
-  const antwoorden = t.ai_antwoorden ? JSON.parse(t.ai_antwoorden) : {}
-  const criteriaScores = t.criteria_scores ? JSON.parse(t.criteria_scores) : {}
-  let bijlageAnalysesList: BijlageAnalyse[] = []
-  try {
-    if (t.bijlage_analyses) {
-      const raw = JSON.parse(t.bijlage_analyses)
-      if (Array.isArray(raw)) bijlageAnalysesList = raw as BijlageAnalyse[]
+  const antwoorden: Record<string, string> = {}
+  const rawAntwoorden = parseStoredJsonRecord(t.ai_antwoorden)
+  if (rawAntwoorden) {
+    for (const [k, v] of Object.entries(rawAntwoorden)) {
+      if (v == null) continue
+      const s = typeof v === 'string' ? v : JSON.stringify(v)
+      if (s.trim()) antwoorden[k] = s
     }
-  } catch {
-    bijlageAnalysesList = []
   }
+
+  const criteriaScores = parseStoredJsonRecord(t.criteria_scores) ?? {}
+
+  const bijlageRaw = parseStoredJsonArray(t.bijlage_analyses)
+  const bijlageAnalysesList = bijlageRaw as BijlageAnalyse[]
+
+  const hasRelevancePanel =
+    t.totaal_score != null ||
+    t.relevantie_score != null ||
+    Object.keys(criteriaScores).length > 0 ||
+    bijlageAnalysesList.length > 0 ||
+    Boolean(typeof t.match_uitleg === 'string' && t.match_uitleg.trim())
+
+  const aiAntwoordEntries = (() => {
+    const qList = ((questions as any[]) || []) as { id: string; vraag?: string; volgorde?: number }[]
+    const byId = new Map(qList.map((q) => [q.id, q]))
+    const entries = Object.entries(antwoorden).filter(([, a]) => a != null && String(a).trim() !== '')
+    entries.sort((a, b) => {
+      const qa = byId.get(a[0])
+      const qb = byId.get(b[0])
+      const oa = qa?.volgorde ?? 999999
+      const ob = qb?.volgorde ?? 999999
+      if (oa !== ob) return oa - ob
+      return a[0].localeCompare(b[0])
+    })
+    return entries.map(([qid, answer]) => ({
+      qid,
+      answer,
+      vraag: byId.get(qid)?.vraag,
+    }))
+  })()
+
   let documenten: StoredDocumentEntry[] = []
   try {
     if (t.document_urls) {
@@ -764,6 +1035,7 @@ export function TenderDetailPage() {
             naam: String(x.naam || 'Document'),
             type: String(x.type || ''),
             bronZipLabel: x.bronZipLabel ? String(x.bronZipLabel) : undefined,
+            addedByUser: Boolean(x.addedByUser),
           }))
           .filter((d: StoredDocumentEntry) => Boolean(d.url?.trim() || d.localNaam?.trim()))
       }
@@ -773,6 +1045,14 @@ export function TenderDetailPage() {
   }
   documenten = hideZipRowIfContentsExpanded(documenten)
     .filter((d) => !unavailableDocKeys.has(d.url ?? '') && !unavailableDocKeys.has(d.localNaam ?? ''))
+
+  const catalogSelectedKeysSet = parseCatalogSelectedKeys(
+    typeof t.document_catalog_selected_keys === 'string' ? t.document_catalog_selected_keys : undefined,
+  )
+  const documentenForCatalog =
+    docSelectionFilter === 'selected'
+      ? documenten.filter((d) => catalogSelectedKeysSet.has(catalogDocumentStableKey(d)))
+      : documenten
 
   const _getDocExt = (naam: string, type?: string) =>
     (type || naam.split('.').pop() || '').toUpperCase()
@@ -788,12 +1068,36 @@ export function TenderDetailPage() {
     const q = docSearch.trim().toLowerCase()
     let filtered = q ? docs.filter(d => d.naam.toLowerCase().includes(q)) : docs
     if (docTypeFilter) filtered = filtered.filter(d => _getDocExt(d.naam, d.type) === docTypeFilter)
-    if (docSortBy === 'type') return [...filtered].sort(_sortDocsByType)
-    return [...filtered].sort((a, b) => a.naam.localeCompare(b.naam))
+    if (filterNieuweDocs && nieuweDocNamen.size > 0) {
+      filtered = filtered.filter(d => nieuweDocNamen.has(d.naam))
+    }
+    // Nieuwe documenten altijd bovenaan sorteren
+    const isNieuw = (d: StoredDocumentEntry) => nieuweDocNamen.has(d.naam)
+    if (docSortBy === 'type') {
+      return [...filtered].sort((a, b) => {
+        const nA = isNieuw(a) ? 0 : 1
+        const nB = isNieuw(b) ? 0 : 1
+        if (nA !== nB) return nA - nB
+        return _sortDocsByType(a, b)
+      })
+    }
+    return [...filtered].sort((a, b) => {
+      const nA = isNieuw(a) ? 0 : 1
+      const nB = isNieuw(b) ? 0 : 1
+      if (nA !== nB) return nA - nB
+      return a.naam.localeCompare(b.naam)
+    })
   }
 
-  const invulDocumenten = _applyDocSortAndSearch(documenten.filter((d) => isFillableDocumentName(d.naam, d.type)))
-  const informatieDocumenten = _applyDocSortAndSearch(documenten.filter((d) => !isFillableDocumentName(d.naam, d.type)))
+  const docHasAgentFillWork = (naam: string) => {
+    const s = fillSummariesByDoc.get(naam)
+    return Boolean(s && (s.total_fields > 0 || s.checklist_total > 0))
+  }
+  const docShowsInvulUi = (d: StoredDocumentEntry) =>
+    isFillableCatalogEntry(d.naam, d.type) || docHasAgentFillWork(d.naam)
+
+  const invulDocumenten = _applyDocSortAndSearch(documentenForCatalog.filter((d) => docShowsInvulUi(d)))
+  const informatieDocumenten = _applyDocSortAndSearch(documentenForCatalog.filter((d) => !docShowsInvulUi(d)))
 
   const localFiles: { naam: string, size: number }[] = Array.isArray(t.local_document_files) ? t.local_document_files : []
   const catalogLocalNames = new Set(
@@ -848,16 +1152,28 @@ export function TenderDetailPage() {
   /** Splits bronNavLinks in bestandslinks (→ documentenpaneel) en paginalinks (→ beschrijving) */
   const bronFileLinks = bronNavLinks.filter(l => isFileUrl(l.url) && !unavailableDocKeys.has(l.url))
   const bronPageLinks = bronNavLinks.filter(l => !isFileUrl(l.url))
+  const bronFileLinksForCatalog =
+    docSelectionFilter === 'selected'
+      ? bronFileLinks.filter((l) => catalogSelectedKeysSet.has(bronFileLinkStableKey(l.url)))
+      : bronFileLinks
 
   const _docSearchQ = docSearch.trim().toLowerCase()
   const _bronLinkExt = (url: string) => (url.split('.').pop()?.split('?')[0] || '').toUpperCase()
-  const filteredBronFileLinks = bronFileLinks
+  const filteredBronFileLinks = bronFileLinksForCatalog
     .filter(l => !_docSearchQ || (l.titel || l.url).toLowerCase().includes(_docSearchQ))
     .filter(l => !docTypeFilter || _bronLinkExt(l.url) === docTypeFilter)
 
+  const catalogShowsInvul = docCatalogWeergave === 'all' || docCatalogWeergave === 'invul'
+  const catalogShowsInlichting = docCatalogWeergave === 'all' || docCatalogWeergave === 'inlichting'
+  /** Bij filter «Invul» geen bronpagina-links (meestal geen inschrijfformulieren). */
+  const showBronFilesInCatalog = docCatalogWeergave !== 'invul'
+  const visibleCatalogDocsCount =
+    (catalogShowsInlichting ? informatieDocumenten.length : 0) +
+    (catalogShowsInvul ? invulDocumenten.length : 0)
+
   const uniqueDocTypes: string[] = Array.from(new Set([
-    ...documenten.map(d => _getDocExt(d.naam, d.type)).filter(Boolean),
-    ...bronFileLinks.map(l => _bronLinkExt(l.url)).filter(Boolean),
+    ...documentenForCatalog.map(d => _getDocExt(d.naam, d.type)).filter(Boolean),
+    ...bronFileLinksForCatalog.map(l => _bronLinkExt(l.url)).filter(Boolean),
   ])).sort()
 
   let aiExtracted: Partial<AiExtractedTenderFields> = {}
@@ -877,6 +1193,48 @@ export function TenderDetailPage() {
   const dispWaarde = t.geraamde_waarde || aiExtracted.geraamde_waarde
   const dispType = t.type_opdracht || aiExtracted.type_opdracht
   const dispRef = t.referentienummer || aiExtracted.referentienummer
+
+  const apiH = procedureContext?.apiHighlights
+  const fmtSummaryDate = (d?: string) => {
+    if (!d?.trim()) return undefined
+    const x = formatDate(d)
+    return x === '-' ? undefined : x
+  }
+  const sluitingSamenvatting = dispSluiting || apiH?.sluitingsDatum
+  const publicatieSamenvatting = dispPublicatie || apiH?.publicatieDatum
+  const samenvattingTxt = (t.ai_samenvatting || '').trim()
+  const beschrijvingTxt = (t.beschrijving || '').trim()
+  const inhoudStukken: string[] = []
+  if (samenvattingTxt) inhoudStukken.push(samenvattingTxt)
+  if (beschrijvingTxt && beschrijvingTxt !== samenvattingTxt) {
+    const frag =
+      beschrijvingTxt.length > 2800 ? `${beschrijvingTxt.slice(0, 2800)}\u2026` : beschrijvingTxt
+    inhoudStukken.push(samenvattingTxt ? `\u2014\nOmschrijving (fragment)\n${frag}` : frag)
+  }
+  if (aiExtracted.cpv_of_werkzaamheden?.trim()) {
+    inhoudStukken.push(`CPV / werkzaamheden: ${aiExtracted.cpv_of_werkzaamheden.trim()}`)
+  }
+  const inhoudSamenvatting = inhoudStukken.join('\n\n').trim()
+  const bronSamenvatting =
+    (t.bron_website_naam && String(t.bron_website_naam).trim()) ||
+    (t.bron_url && String(t.bron_url).replace(/^https?:\/\//i, '').split('/')[0]) ||
+    undefined
+  const tenderSummaryPayload: TenderSummaryExportPayload = {
+    titel: (t.titel && String(t.titel).trim()) || 'Aanbesteding',
+    inhoud: inhoudSamenvatting || undefined,
+    locatie: dispRegio?.trim() || undefined,
+    opdrachtgever: dispOpdrachtgever?.trim() || undefined,
+    startUitvoering: fmtSummaryDate(aiExtracted.datum_start_uitvoering),
+    eindeUitvoering: fmtSummaryDate(aiExtracted.datum_einde_uitvoering),
+    uiterlijkIndienen: fmtSummaryDate(sluitingSamenvatting),
+    budget: dispWaarde?.trim() || undefined,
+    typeOpdracht: dispType?.trim() || undefined,
+    referentie: dispRef?.trim() || undefined,
+    procedure: aiExtracted.procedure_type?.trim() || apiH?.typePublicatie?.trim() || undefined,
+    publicatie: fmtSummaryDate(publicatieSamenvatting),
+    bron: bronSamenvatting,
+    indiening: aiExtracted.indiening_adres?.trim() || undefined,
+  }
 
   const runStartAnalysisFlow = async (opts?: { discardCheckpoint?: boolean }) => {
     if (analyzing || thisTenderMainAnalyseRunning || aiAnalyseInWachtrij) return
@@ -933,6 +1291,14 @@ export function TenderDetailPage() {
 
   const handleAnalyze = async () => {
     if (analyzing || thisTenderMainAnalyseRunning || aiAnalyseInWachtrij) return
+    if (t?.totaal_score != null) {
+      const proceed = window.confirm(
+        `Waarschuwing: deze aanbesteding is al volledig geanalyseerd (score ${Math.round(t.totaal_score)}).\n` +
+          'Opnieuw analyseren verbruikt extra tokens.\n\n' +
+          'Toch opnieuw analyseren?',
+      )
+      if (!proceed) return
+    }
     try {
       const ck = (await api.getAnalysisCheckpoint?.(id!)) as
         | { hasCheckpoint?: boolean; configMismatch?: boolean; stage?: string | null }
@@ -996,8 +1362,25 @@ export function TenderDetailPage() {
 
   const handleStartRisicoHeranalyse = async () => {
     if (!id || risicoTabBusy) return
+    setRisicoModelPickerOpen(true)
+  }
+
+  const handleRisicoModelSelected = async (modelId: string) => {
+    setRisicoModelPickerOpen(false)
+    if (!id) return
     try {
-      await (api as any).startRisicoAnalyse(id)
+      let result: { success: boolean; error?: string } | undefined
+      if (modelId === 'agentic') {
+        result = await (api as any).startRisicoAnalyseV2(id) as { success: boolean; error?: string }
+      } else if (modelId === 'default') {
+        await (api as any).startRisicoAnalyse(id)
+      } else {
+        await (api as any).startRisicoAnalyseWithModel(id, modelId)
+      }
+      if (result && !result.success && result.error) {
+        setAnalysisError(`Agentic analyse mislukt: ${result.error}`)
+        return
+      }
       setActiveTab('risico')
     } catch (err: any) {
       setAnalysisError(err.message || 'Risico-heranalyse starten mislukt')
@@ -1065,7 +1448,7 @@ export function TenderDetailPage() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="flex min-h-0 flex-1 flex-col gap-6">
       <LocalDocumentPreviewModal
         open={Boolean(localPreviewFile) || Boolean(bronPreview)}
         tenderId={id!}
@@ -1092,6 +1475,16 @@ export function TenderDetailPage() {
         title={bronPageEmbed?.title ?? ''}
         tenderId={id!}
         onClose={() => setBronPageEmbed(null)}
+      />
+      <TenderSummaryModal
+        open={summaryModalOpen && !risicoTabBusy}
+        onClose={() => setSummaryModalOpen(false)}
+        data={tenderSummaryPayload}
+      />
+      <RisicoModelPickerModal
+        open={risicoModelPickerOpen}
+        onClose={() => setRisicoModelPickerOpen(false)}
+        onSelect={handleRisicoModelSelected}
       />
       <DeleteConfirmationModal
         open={showDeleteConfirm}
@@ -1239,6 +1632,15 @@ export function TenderDetailPage() {
                   : 'AI Analyse'}
             </span>
           </button>
+          <button
+            type="button"
+            onClick={() => setSummaryModalOpen(true)}
+            title="Korte samenvatting: inhoud, locatie, opdrachtgever, planning, deadline, budget"
+            className="flex items-center gap-1.5 rounded-lg border border-[var(--primary)]/35 bg-[var(--primary)]/8 px-3 py-2 text-sm font-medium text-[var(--primary)] hover:bg-[var(--primary)]/14 transition-colors"
+          >
+            <ScrollText className="h-4 w-4 shrink-0" />
+            Samenvatting
+          </button>
           <button onClick={() => handleExport('pdf')} className="flex items-center gap-1.5 rounded-lg border px-3 py-2 text-sm hover:bg-[var(--muted)] transition-colors">
             <Download className="h-4 w-4" /> PDF
           </button>
@@ -1264,59 +1666,68 @@ export function TenderDetailPage() {
       )}
 
       {showMainAnalyseProgressBanner && (
-        <div className="rounded-xl border bg-[var(--card)] p-4 shadow-sm space-y-2">
-          <div className="flex items-center gap-2">
-            <Loader2 className="h-5 w-5 shrink-0 animate-spin text-[var(--primary)]" aria-hidden />
-            <span className="text-sm font-medium text-[var(--foreground)]">AI-analyse</span>
+        <div className="self-start w-full max-w-[430px] rounded-md border bg-[var(--card)] px-2.5 py-1.5 shadow-sm">
+          <div className="mb-1 flex items-center gap-1.5">
+            <Loader2
+              className="h-3.5 w-3.5 shrink-0 animate-spin"
+              style={{ color: mainAnalyseProgressAccentColor(mainAnalyseProgressPct) }}
+              aria-hidden
+            />
+            <span className="text-[11px] font-semibold text-[var(--foreground)]">AI-analyse</span>
             {mainAnalyseAgent ? (
-              <span className="rounded-md bg-[var(--muted)] px-2 py-0.5 text-[11px] font-medium text-[var(--muted-foreground)]">
+              <span className="rounded bg-[var(--muted)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--muted-foreground)]">
                 {mainAnalyseAgent}
               </span>
             ) : null}
+            <span className="ml-auto text-[10px] font-semibold tabular-nums text-[var(--muted-foreground)]">
+              {mainAnalyseProgressPct}%
+            </span>
           </div>
-          <div className="h-2 w-full rounded-full bg-[var(--muted)]">
+          <div className="h-1.5 w-full rounded-full bg-[var(--muted)]">
             <div
-              className="h-2 rounded-full bg-[var(--primary)] transition-all duration-500"
-              style={{ width: `${mainAnalyseProgressPct}%` }}
+              className="h-1.5 rounded-full transition-[width,background-color] duration-500 ease-out"
+              style={{
+                width: `${mainAnalyseProgressPct}%`,
+                backgroundColor: mainAnalyseProgressAccentColor(mainAnalyseProgressPct),
+              }}
             />
           </div>
-          <p className="text-xs text-[var(--muted-foreground)] leading-relaxed">{mainAnalyseBannerStep}</p>
         </div>
       )}
 
       {/* =================== TABS =================== */}
-      <div className="flex items-center gap-1 rounded-xl border bg-[var(--card)] p-1 shadow-sm">
+      <div className="inline-flex w-fit max-w-full flex-wrap items-center gap-0.5 self-start rounded-xl border bg-[var(--card)] p-0.5 shadow-sm">
         <button
           type="button"
           onClick={() => setActiveTab('overzicht')}
           aria-busy={overzichtTabBusy}
-          className={`flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-all ${activeTab === 'overzicht' ? 'bg-[var(--primary)] text-[var(--primary-foreground)] shadow-sm' : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)] hover:bg-[var(--muted)]'}`}
+          className={`flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium transition-all ${activeTab === 'overzicht' ? 'bg-[var(--primary)] text-[var(--primary-foreground)] shadow-sm' : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)] hover:bg-[var(--muted)]'}`}
         >
           {overzichtTabBusy ? (
-            <Loader2 className="h-4 w-4 shrink-0 animate-spin" aria-hidden />
+            <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" aria-hidden />
           ) : (
-            <Brain className="h-4 w-4 shrink-0" aria-hidden />
+            <Brain className="h-3.5 w-3.5 shrink-0" aria-hidden />
           )}
           Overzicht & Analyse
         </button>
         <button
           type="button"
           onClick={() => setActiveTab('inschrijving')}
-          className={`flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-all ${activeTab === 'inschrijving' ? 'bg-[var(--primary)] text-[var(--primary-foreground)] shadow-sm' : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)] hover:bg-[var(--muted)]'}`}
+          className={`flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium transition-all ${activeTab === 'inschrijving' ? 'bg-[var(--primary)] text-[var(--primary-foreground)] shadow-sm' : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)] hover:bg-[var(--muted)]'}`}
         >
-          <ClipboardList className="h-4 w-4 shrink-0" aria-hidden />
+          <ClipboardList className="h-3.5 w-3.5 shrink-0" aria-hidden />
           Inschrijving & Procedure
         </button>
         <button
           type="button"
           onClick={() => setActiveTab('risico')}
           aria-busy={risicoTabBusy}
-          className={`flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-all ${activeTab === 'risico' ? 'bg-[var(--primary)] text-[var(--primary-foreground)] shadow-sm' : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)] hover:bg-[var(--muted)]'}`}
+          className={`flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium transition-all ${activeTab === 'risico' ? 'bg-[var(--primary)] text-[var(--primary-foreground)] shadow-sm' : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)] hover:bg-[var(--muted)]'}`}
         >
           {risicoTabBusy ? (
-            <Loader2 className="h-4 w-4 shrink-0 animate-spin" aria-hidden />
+            <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" aria-hidden />
           ) : (
-            <ShieldAlert className="h-4 w-4 shrink-0" aria-hidden />
+            <ShieldAlert className="h-3.5 w-3.5 shrink-0" aria-hidden />
           )}
           Risico Inventarisatie
           {t.risico_analyse && (
@@ -1333,50 +1744,25 @@ export function TenderDetailPage() {
             type="button"
             onClick={handleStartRisicoHeranalyse}
             disabled={risicoTabBusy || thisTenderAnalysisRunning}
-            title="Risico-inventarisatie opnieuw uitvoeren"
-            className="ml-auto flex items-center gap-1.5 rounded-lg border border-[var(--border)] px-2.5 py-1.5 text-xs text-[var(--muted-foreground)] hover:text-[var(--foreground)] hover:bg-[var(--muted)] disabled:opacity-40 transition-colors"
+            title="Nieuwe risico: volledige risico-inventarisatie opnieuw (alleen op jouw actie; geen automatische herstart na AI-analyse)"
+            className="ml-1 flex items-center gap-1 rounded-md border border-[var(--border)] px-2 py-1 text-[10px] text-[var(--muted-foreground)] hover:text-[var(--foreground)] hover:bg-[var(--muted)] disabled:opacity-40 transition-colors"
           >
             {risicoTabBusy ? (
               <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
             ) : (
-              <RefreshCw className="h-3.5 w-3.5" aria-hidden />
+              <Sparkles className="h-3.5 w-3.5 shrink-0" aria-hidden />
             )}
-            <span>Risico heranalyse</span>
+            <span className="whitespace-nowrap">Nieuwe risico</span>
           </button>
         )}
       </div>
 
-      {/* =================== TWO COLUMN LAYOUT =================== */}
-      <div className="flex gap-6 items-start">
-
-        {/* LEFT COLUMN - Main content */}
-        <div className="flex-1 min-w-0 space-y-6">
-
-          {/* ── Risico Tab ── */}
-          {activeTab === 'risico' && (
-            <RisicoTab
-              aanbestedingId={id!}
-              risicoAnalyseJson={t.risico_analyse}
-              risicoAnalyseAt={t.risico_analyse_at}
-              risicoWachtrijPositie={risicoWachtrijPositie}
-              onRefresh={refresh}
-            />
-          )}
-
-          {/* ── Inschrijving & Procedure Tab ── */}
-          {activeTab === 'inschrijving' && (
-            <InschrijvingTab
-              tender={t}
-              procedureContext={procedureContext}
-              aiExtracted={aiExtracted}
-              criteriaScores={criteriaScores}
-              bronNavLinks={bronNavLinks}
-            />
-          )}
+      {/* Overzicht: twee kolommen; links scrollt, documentenpaneel vult de rij (geen dvh buiten main) */}
+      {activeTab === 'overzicht' ? (
+        <div className="flex min-h-0 flex-1 gap-6 items-stretch">
+          <div className="min-h-0 flex-1 min-w-0 overflow-y-auto space-y-6">
 
           {/* ── Overzicht Tab content ── */}
-          {activeTab === 'overzicht' && (<>
-
           {/* Title & status */}
           <div className="rounded-xl border bg-[var(--card)] p-6 shadow-sm">
             <div className="flex items-start justify-between gap-4">
@@ -1468,11 +1854,13 @@ export function TenderDetailPage() {
 
           {procedureContext && <ProcedureOverviewCard context={procedureContext} />}
 
-          {/* Score card - Match-based scoring */}
-          {t.totaal_score != null && (
+          {/* Score card — ook tonen als alleen criteria/bijlage/match_uitleg zijn opgeslagen (totaal_score kan ontbreken) */}
+          {hasRelevancePanel && (
             <div className="rounded-xl border bg-[var(--card)] p-6 shadow-sm">
               <div className="flex items-center justify-between mb-4">
-                <h2 className="text-base font-semibold">Relevantiescore</h2>
+                <h2 className="text-base font-semibold">
+                  {t.totaal_score != null ? 'Relevantiescore' : 'Criteria & bijlage-analyses'}
+                </h2>
                 <div className="flex items-center gap-4 text-[10px] text-[var(--muted-foreground)]">
                   <span className="flex items-center gap-1"><CircleCheck className="h-3.5 w-3.5 text-green-500" /> Match</span>
                   <span className="flex items-center gap-1"><CircleDot className="h-3.5 w-3.5 text-yellow-500" /> Gedeeltelijk</span>
@@ -1482,13 +1870,20 @@ export function TenderDetailPage() {
               </div>
 
               <div className="flex items-start gap-6">
-                <div className="flex flex-col items-center gap-1 flex-shrink-0">
-                  <div className={`flex h-20 w-20 items-center justify-center rounded-full border-4 text-2xl font-bold ${getScoreColor(t.totaal_score)}`}
-                    style={{ borderColor: t.totaal_score >= 70 ? '#16a34a' : t.totaal_score >= 40 ? '#ca8a04' : '#dc2626' }}>
-                    {Math.round(t.totaal_score)}
+                {t.totaal_score != null ? (
+                  <div className="flex flex-col items-center gap-1 flex-shrink-0">
+                    <div className={`flex h-20 w-20 items-center justify-center rounded-full border-4 text-2xl font-bold ${getScoreColor(t.totaal_score)}`}
+                      style={{ borderColor: t.totaal_score >= 70 ? '#16a34a' : t.totaal_score >= 40 ? '#ca8a04' : '#dc2626' }}>
+                      {Math.round(t.totaal_score)}
+                    </div>
+                    <span className="text-[10px] text-[var(--muted-foreground)]">van 100</span>
                   </div>
-                  <span className="text-[10px] text-[var(--muted-foreground)]">van 100</span>
-                </div>
+                ) : (
+                  <div className="flex max-w-[140px] flex-shrink-0 flex-col gap-1 rounded-lg border border-dashed border-[var(--border)] bg-[var(--muted)]/20 p-3 text-[10px] text-[var(--muted-foreground)]">
+                    <span className="font-medium text-[var(--foreground)]">Geen totaalscore</span>
+                    <span>Opgeslagen criteria- en bijlage-analyses staan hiernaast / hieronder.</span>
+                  </div>
+                )}
 
                 <div className="flex-1 space-y-1.5">
                   {Object.keys(criteriaScores).length > 0 && (
@@ -1695,21 +2090,21 @@ export function TenderDetailPage() {
             </div>
           )}
 
-          {/* AI Q&A eerst, daarna samenvatting (volgorde analyse) */}
-          {Object.keys(antwoorden).length > 0 && (
+          {/* AI Q&A — alle opgeslagen antwoorden, ook als de vraag intussen verwijderd of gewijzigd is */}
+          {aiAntwoordEntries.length > 0 && (
             <div className="rounded-xl border bg-[var(--card)] p-6 shadow-sm">
               <h2 className="text-base font-semibold mb-4">Analyse — vragen en antwoorden</h2>
               <div className="space-y-4">
-                {(questions as any[])?.map((q: any) => {
-                  const answer = antwoorden[q.id]
-                  if (!answer) return null
-                  return (
-                    <div key={q.id} className="rounded-lg bg-[var(--muted)]/50 p-4">
-                      <p className="text-sm font-medium text-[var(--foreground)]">{q.vraag}</p>
-                      <p className="mt-2 text-sm text-[var(--muted-foreground)] whitespace-pre-wrap">{answer}</p>
-                    </div>
-                  )
-                })}
+                {aiAntwoordEntries.map(({ qid, answer, vraag }) => (
+                  <div key={qid} className="rounded-lg bg-[var(--muted)]/50 p-4">
+                    <p className="text-sm font-medium text-[var(--foreground)]">
+                      {vraag?.trim()
+                        ? vraag
+                        : 'Eerdere analyse (vraag staat niet meer in de lijst — antwoord wel bewaard)'}
+                    </p>
+                    <p className="mt-2 text-sm text-[var(--muted-foreground)] whitespace-pre-wrap">{answer}</p>
+                  </div>
+                ))}
               </div>
             </div>
           )}
@@ -1798,112 +2193,242 @@ export function TenderDetailPage() {
               className="w-full rounded-lg border bg-[var(--background)] p-3 text-sm focus:outline-none focus:ring-2 focus:ring-[var(--ring)] min-h-[100px] resize-y"
             />
           </div>
-          </>)}
-        </div>
+          </div>
 
-        {/* RIGHT COLUMN - Documents sidebar (alleen bij Overzicht tab) */}
-        {activeTab === 'overzicht' && (
-        <div className="sticky top-6 flex h-[calc(100vh-10rem)] max-h-[calc(100vh-10rem)] w-72 min-h-0 shrink-0 flex-col">
+        {/* RIGHT COLUMN - Documenten */}
+        <div className="z-10 flex w-72 shrink-0 flex-col overflow-hidden min-h-0 self-stretch">
           <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border bg-[var(--card)] shadow-sm">
             {/* Header */}
-            <div className="shrink-0 bg-[var(--primary)] px-4 py-3">
+            <div className="shrink-0 bg-[var(--primary)] px-3 py-2">
               <div className="flex items-start justify-between gap-2">
                 <div className="min-w-0 flex-1">
                   <h3 className="text-sm font-semibold text-[var(--primary-foreground)] flex items-center gap-2">
                     <FileText className="h-4 w-4 shrink-0" />
                     Documenten
                   </h3>
-                  <p className="text-[10px] text-[var(--primary-foreground)]/70 mt-0.5 leading-snug">
-                    {discoverStep ? discoverStep
+                  {(() => {
+                    const sub = discoverStep
+                      ? discoverStep
                       : (documenten.length + bronFileLinks.length) > 0
                         ? `${documenten.length + bronFileLinks.length} document(en)${bronFileLinks.length > 0 ? ` (incl. ${bronFileLinks.length} van bronpagina)` : ''}`
-                        : 'AI-analyse opent de bron-URL, leest tabbladen (TenderNed, Mercell indien gelinkt), haalt alle bijlagen op en analyseert per document'}
-                  </p>
+                        : null
+                    return sub ? (
+                      <p className="mt-0.5 text-[10px] leading-snug text-[var(--primary-foreground)]/70">{sub}</p>
+                    ) : null
+                  })()}
                 </div>
                 {t.bron_url ? (
-                  <div className="flex shrink-0 items-center gap-0.5">
+                  <div className="flex shrink-0 items-center gap-1">
                     <button
                       type="button"
                       onClick={handleDiscoverDocuments}
                       disabled={discoveringDocs || globalAnalysisBusy || analyzing}
                       title="AI: opnieuw tracking van TenderNed/Mercell — tabbladen, links uit tekst, aanvullende documenten (configureer OpenAI of Claude onder Instellingen)"
-                      className="rounded-md p-1.5 text-[var(--primary-foreground)] hover:bg-white/15 disabled:opacity-40 transition-colors"
+                      className="inline-flex h-7 items-center gap-1 rounded-md border border-white/20 px-2 text-[10px] font-semibold text-[var(--primary-foreground)] hover:bg-white/15 disabled:opacity-40 transition-colors"
                     >
                       {discoveringDocs ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
+                        <Loader2 className="h-3 w-3 animate-spin" />
                       ) : (
-                        <Sparkles className="h-4 w-4" />
+                        <Sparkles className="h-3 w-3" />
                       )}
+                      Zoeken
                     </button>
                     <button
                       type="button"
                       onClick={handleAnalyze}
                       disabled={analysisButtonDisabled}
                       title="Volledige AI-analyse opnieuw — leest alle bijlagen en herberekent score"
-                      className="rounded-md p-1.5 text-[var(--primary-foreground)] hover:bg-white/15 disabled:opacity-40 transition-colors"
+                      className="inline-flex h-7 items-center gap-1 rounded-md border border-white/20 px-2 text-[10px] font-semibold text-[var(--primary-foreground)] hover:bg-white/15 disabled:opacity-40 transition-colors"
                     >
-                      <RefreshCw className="h-4 w-4" />
+                      <RefreshCw className="h-3 w-3" />
+                      Analyse
                     </button>
                   </div>
                 ) : null}
               </div>
             </div>
 
-            {/* Search + Filter bar */}
-            <div className="shrink-0 border-b border-[var(--border)] bg-[var(--card)] px-3 py-2 space-y-1.5">
+            {/* Search + filter: compact, één flex-wrap-rij (minder hoog = meer ruimte voor de lijst) */}
+            <div className="shrink-0 space-y-1 border-b border-[var(--border)] bg-[var(--muted)]/10 px-2 py-1.5">
               <div className="relative">
-                <Search className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-[var(--muted-foreground)]" />
+                <Search className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 h-3 w-3 text-[var(--muted-foreground)]" />
                 <input
                   type="text"
                   value={docSearch}
                   onChange={(e) => setDocSearch(e.target.value)}
-                  placeholder="Documenten zoeken…"
-                  className="w-full rounded-md border border-[var(--border)] bg-[var(--background)] pl-7 pr-2 py-1.5 text-xs placeholder:text-[var(--muted-foreground)] focus:outline-none focus:ring-1 focus:ring-[var(--ring)]"
+                  placeholder="Zoeken…"
+                  className="h-7 w-full rounded border border-[var(--border)] bg-[var(--background)] py-1 pl-7 pr-6 text-[11px] placeholder:text-[var(--muted-foreground)] focus:outline-none focus:ring-1 focus:ring-[var(--ring)]"
                 />
                 {docSearch && (
                   <button
                     type="button"
                     onClick={() => setDocSearch('')}
-                    className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
+                    className="absolute right-1.5 top-1/2 -translate-y-1/2 text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
                     aria-label="Zoekopdracht wissen"
                   >
                     ×
                   </button>
                 )}
               </div>
-              <div className="flex items-center gap-1">
-                <ArrowUpDown className="h-3 w-3 shrink-0 text-[var(--muted-foreground)]" aria-hidden />
-                <span className="text-[10px] text-[var(--muted-foreground)] mr-0.5">Sorteren:</span>
-                <button
-                  type="button"
-                  onClick={() => { setDocSortBy('naam'); setDocTypeFilter(null) }}
-                  className={`rounded px-2 py-0.5 text-[10px] font-medium transition-colors ${
-                    docSortBy === 'naam'
-                      ? 'bg-[var(--primary)] text-[var(--primary-foreground)]'
-                      : 'bg-[var(--muted)] text-[var(--muted-foreground)] hover:bg-[var(--muted)]/70'
-                  }`}
-                >
-                  Naam
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setDocSortBy('type')}
-                  className={`rounded px-2 py-0.5 text-[10px] font-medium transition-colors ${
-                    docSortBy === 'type'
-                      ? 'bg-[var(--primary)] text-[var(--primary-foreground)]'
-                      : 'bg-[var(--muted)] text-[var(--muted-foreground)] hover:bg-[var(--muted)]/70'
-                  }`}
-                >
-                  Soort {docTypeFilter ? `· ${docTypeFilter}` : ''}
-                </button>
+              {/* Row 1: Sort + Cat filters */}
+              <div className="flex items-center gap-2">
+                {/* Sort group */}
+                <div className="flex items-center gap-1">
+                  <span className="flex items-center gap-0.5 text-[var(--muted-foreground)]" title="Sorteren">
+                    <ArrowUpDown className="h-3 w-3 shrink-0" aria-hidden />
+                    <span className="text-[9px] font-bold uppercase tracking-wide">Sort</span>
+                  </span>
+                  <div className="flex items-center rounded-md border border-[var(--border)] bg-[var(--muted)] p-0.5 gap-0.5">
+                    <button
+                      type="button"
+                      onClick={() => { setDocSortBy('naam'); setDocTypeFilter(null) }}
+                      className={`h-6 rounded px-2 text-[11px] font-semibold leading-none transition-colors ${
+                        docSortBy === 'naam'
+                          ? 'bg-[var(--background)] text-[var(--foreground)] shadow-sm'
+                          : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)]'
+                      }`}
+                    >
+                      Naam
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDocSortBy('type')}
+                      className={`h-6 max-w-[6rem] truncate rounded px-2 text-[11px] font-semibold leading-none transition-colors ${
+                        docSortBy === 'type'
+                          ? 'bg-[var(--background)] text-[var(--foreground)] shadow-sm'
+                          : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)]'
+                      }`}
+                    >
+                      Soort{docTypeFilter ? ` ${docTypeFilter}` : ''}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDocSelectionFilter((f) => (f === 'selected' ? 'all' : 'selected'))}
+                      title="Alleen aangevinkte documenten tonen"
+                      className={`h-6 max-w-[7rem] truncate rounded px-2 text-[11px] font-semibold leading-none transition-colors ${
+                        docSelectionFilter === 'selected'
+                          ? 'bg-[var(--background)] text-[var(--foreground)] shadow-sm'
+                          : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)]'
+                      }`}
+                    >
+                      Geselecteerd{catalogSelectedKeysSet.size > 0 ? ` (${catalogSelectedKeysSet.size})` : ''}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="h-4 w-px shrink-0 bg-[var(--border)]" aria-hidden />
+
+                {/* Cat group */}
+                <div className="flex items-center gap-1">
+                  <span className="text-[9px] font-bold uppercase tracking-wide text-[var(--muted-foreground)]">Cat</span>
+                  <div className="flex items-center rounded-md border border-[var(--border)] bg-[var(--muted)] p-0.5 gap-0.5">
+                    <button
+                      type="button"
+                      onClick={() => setDocCatalogWeergave('all')}
+                      title="Alle catalogusdocumenten"
+                      className={`h-6 rounded px-2 text-[11px] font-semibold leading-none transition-colors ${
+                        docCatalogWeergave === 'all'
+                          ? 'bg-[var(--background)] text-[var(--foreground)] shadow-sm'
+                          : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)]'
+                      }`}
+                    >
+                      Alles
+                    </button>
+                    {FEATURE_DOCUMENT_FORM_FILL ? (
+                      <button
+                        type="button"
+                        onClick={() => setDocCatalogWeergave('invul')}
+                        title="Alleen invuldocumenten (formulieren, offertes)"
+                        className={`inline-flex h-6 items-center gap-1 rounded px-2 text-[11px] font-semibold leading-none transition-colors ${
+                          docCatalogWeergave === 'invul'
+                            ? 'bg-[var(--background)] text-[var(--foreground)] shadow-sm'
+                            : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)]'
+                        }`}
+                      >
+                        <FileEdit className="h-3 w-3 shrink-0" aria-hidden />
+                        Invul
+                      </button>
+                    ) : null}
+                    <button
+                      type="button"
+                      onClick={() => setDocCatalogWeergave('inlichting')}
+                      title="Alleen inlichtingsdocumenten en links van de bronpagina"
+                      className={`inline-flex h-6 items-center gap-1 rounded px-2 text-[11px] font-semibold leading-none transition-colors ${
+                        docCatalogWeergave === 'inlichting'
+                          ? 'bg-[var(--background)] text-[var(--foreground)] shadow-sm'
+                          : 'text-[var(--muted-foreground)] hover:text-[var(--foreground)]'
+                      }`}
+                    >
+                      <FileText className="h-3 w-3 shrink-0" aria-hidden />
+                      Inlichting
+                    </button>
+                  </div>
+                </div>
+
+                {/* Action buttons — pushed to the right */}
+                <div className="ml-auto flex items-center gap-1.5">
+                  {/* Knipperende filter-knop voor nieuwe documenten */}
+                  {nieuweDocNamen.size > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setFilterNieuweDocs((f) => !f)}
+                      title={filterNieuweDocs ? 'Filter opheffen — alle documenten tonen' : `${nieuweDocNamen.size} nieuwe document(en) — klik om te filteren`}
+                      className={`relative inline-flex h-6 items-center gap-1 rounded border px-2 text-[11px] font-semibold transition-colors ${
+                        filterNieuweDocs
+                          ? 'border-red-400 bg-red-500 text-white'
+                          : 'border-red-300 bg-red-50 text-red-700 hover:bg-red-100 dark:border-red-700 dark:bg-red-950/40 dark:text-red-300'
+                      }`}
+                    >
+                      {!filterNieuweDocs && (
+                        <span className="absolute inset-0 rounded animate-ping bg-red-400 opacity-20 pointer-events-none" />
+                      )}
+                      <Zap className={`h-3 w-3 shrink-0 ${!filterNieuweDocs ? 'animate-pulse' : ''}`} aria-hidden />
+                      Nieuw ({nieuweDocNamen.size})
+                    </button>
+                  )}
+                  {isElectron && id ? (
+                    <button
+                      type="button"
+                      onClick={() => void handleAddManualDocuments()}
+                      disabled={manualDocAdding || discoveringDocs}
+                      title="Kies bestand(en) op je computer; ze worden gekopieerd naar de interne tender-map en in deze lijst getoond."
+                      className="inline-flex h-6 items-center gap-1 rounded border border-[var(--border)] bg-[var(--background)] px-2 text-[11px] font-semibold text-[var(--foreground)] hover:bg-[var(--muted)]/60 disabled:opacity-50"
+                    >
+                      {manualDocAdding ? (
+                        <Loader2 className="h-3 w-3 animate-spin shrink-0" aria-hidden />
+                      ) : (
+                        <Plus className="h-3 w-3 shrink-0" aria-hidden />
+                      )}
+                      bestand
+                    </button>
+                  ) : null}
+                  {isElectron && id && catalogSelectedKeysSet.size > 0 ? (
+                    <button
+                      type="button"
+                      onClick={() => void removeSelectedCatalogEntries([...catalogSelectedKeysSet])}
+                      disabled={removeCatalogBusy}
+                      className="inline-flex h-6 items-center gap-1 rounded border border-red-200 bg-red-50 px-2 text-[11px] font-semibold text-red-800 hover:bg-red-100 dark:border-red-800/50 dark:bg-red-950/40 dark:text-red-200 dark:hover:bg-red-950/60 disabled:opacity-50"
+                    >
+                      {removeCatalogBusy ? (
+                        <Loader2 className="h-3 w-3 animate-spin shrink-0" aria-hidden />
+                      ) : (
+                        <Trash2 className="h-3 w-3 shrink-0" aria-hidden />
+                      )}
+                      Verwijder ({catalogSelectedKeysSet.size})
+                    </button>
+                  ) : null}
+                </div>
               </div>
+              {isElectron && id && manualUploadHint ? (
+                <p className="text-[9px] leading-tight text-[var(--muted-foreground)]">{manualUploadHint}</p>
+              ) : null}
               {/* Type chips — alleen zichtbaar als "Soort" actief is en er types zijn */}
               {docSortBy === 'type' && uniqueDocTypes.length > 0 && (
-                <div className="flex flex-wrap gap-1 pt-0.5">
+                <div className="flex flex-wrap gap-0.5">
                   <button
                     type="button"
                     onClick={() => setDocTypeFilter(null)}
-                    className={`rounded px-2 py-0.5 text-[10px] font-medium transition-colors ${
+                    className={`h-5 rounded px-1.5 text-[9px] font-medium leading-none transition-colors ${
                       !docTypeFilter
                         ? 'bg-[var(--foreground)] text-[var(--background)]'
                         : 'bg-[var(--muted)] text-[var(--muted-foreground)] hover:bg-[var(--muted)]/70'
@@ -1916,7 +2441,7 @@ export function TenderDetailPage() {
                       key={ext}
                       type="button"
                       onClick={() => setDocTypeFilter(docTypeFilter === ext ? null : ext)}
-                      className={`rounded px-2 py-0.5 text-[10px] font-medium transition-colors ${
+                      className={`h-5 rounded px-1.5 text-[9px] font-medium leading-none transition-colors ${
                         docTypeFilter === ext
                           ? 'bg-[var(--primary)] text-[var(--primary-foreground)]'
                           : 'bg-[var(--muted)] text-[var(--muted-foreground)] hover:bg-[var(--muted)]/70'
@@ -1929,14 +2454,16 @@ export function TenderDetailPage() {
               )}
             </div>
 
-            <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-y-contain scroll-smooth [scrollbar-gutter:stable]">
+            <div className="min-h-0 flex-1 basis-0 overflow-y-auto overflow-x-hidden overscroll-y-contain scroll-smooth [scrollbar-gutter:stable]">
               {/* Catalogus-documenten (van document_urls), gegroepeerd: invuldocumenten / informatie */}
               {documenten.length > 0 && (
                 <div>
                   {([
-                    { label: 'Inlichtingsdocumenten', docs: informatieDocumenten },
-                    { label: 'Invuldocumenten', docs: invulDocumenten },
-                  ] as { label: string; docs: StoredDocumentEntry[] }[]).map(({ label, docs }) =>
+                    { label: 'Inlichtingsdocumenten', docs: informatieDocumenten, show: catalogShowsInlichting },
+                    { label: 'Invuldocumenten', docs: invulDocumenten, show: catalogShowsInvul },
+                  ] as const)
+                    .filter((g) => g.show)
+                    .map(({ label, docs }) =>
                     docs.length > 0 ? (                      <div key={label} className="border-b border-[var(--border)] last:border-b-0">
                         <p className="px-3 pt-2.5 pb-1.5 text-[10px] font-bold uppercase tracking-wider text-[var(--foreground)] bg-[var(--muted)]/40 border-b border-[var(--border)]">
                           {label}
@@ -1949,44 +2476,96 @@ export function TenderDetailPage() {
                             const localSize = isLocal
                               ? localFiles.find((f) => f.naam === doc.localNaam)?.size ?? 0
                               : 0
+                            const docKey = catalogDocumentStableKey(doc)
+                            const isFill = docShowsInvulUi(doc)
+                            const qualified = t.status === 'gekwalificeerd'
+                            const canFill = qualified && isFill && isLocal
 
+                            const isNieuwDoc = nieuweDocNamen.has(doc.naam)
                             return (
-                              <div key={`${doc.localNaam || doc.url || i}-${i}`} className="group">
+                              <div key={`${doc.localNaam || doc.url || i}-${i}`} className={`group relative ${isNieuwDoc ? 'bg-red-50/60 dark:bg-red-950/20' : ''}`}>
+                                {isNieuwDoc && (
+                                  <span className="absolute left-0 top-0 bottom-0 w-0.5 bg-red-500 rounded-r" aria-hidden />
+                                )}
                                 <div className="flex items-center justify-between gap-2 px-3 pt-3 pb-1">
-                                  <p className="text-[10px] font-semibold uppercase tracking-wider text-[var(--muted-foreground)]">
-                                    {ext && <span className="inline-flex items-center rounded bg-[var(--muted)] px-1 py-0.5 text-[9px] font-bold mr-1.5">{ext}</span>}
+                                  <p className="text-[10px] font-semibold uppercase tracking-wider text-[var(--muted-foreground)] flex items-center flex-wrap gap-1">
+                                    {ext && <span className="inline-flex items-center rounded bg-[var(--muted)] px-1 py-0.5 text-[9px] font-bold">{ext}</span>}
+                                    {isNieuwDoc && (
+                                      <span className="inline-flex items-center gap-0.5 rounded-full bg-red-100 px-1.5 py-0.5 text-[9px] font-bold text-red-700 dark:bg-red-900/40 dark:text-red-400">
+                                        <Zap className="h-2.5 w-2.5 animate-pulse" aria-hidden />
+                                        Nieuw
+                                      </span>
+                                    )}
+                                    {doc.addedByUser ? (
+                                      <span className="font-normal normal-case text-[9px] text-emerald-700 dark:text-emerald-400">eigen upload</span>
+                                    ) : null}
                                     {isLocal && (
                                       <span className="font-normal normal-case text-[9px] text-[var(--primary)]">lokaal</span>
                                     )}
-                                  </p>
-                                </div>
-                                <button
-                                  type="button"
-                                  title={isLocal ? doc.localNaam : doc.url}
-                                  onClick={() => {
-                                    setBronPreview(null)
-                                    if (isLocal && doc.localNaam) {
-                                      void handleLocalFileClick({ naam: doc.localNaam, size: localSize })
-                                    } else if (doc.url) {
-                                      setLocalPreviewFile(null)
-                                      setBronPreview({ url: doc.url, naam: fileName })
-                                    }
-                                  }}
-                                  className="flex w-full items-start gap-3 px-3 pb-1 text-left hover:bg-[var(--muted)]/50 transition-colors"
-                                >
-                                  <div className="mt-0.5 flex-shrink-0">{getFileIcon(fileName, doc.type)}</div>
-                                  <div className="flex-1 min-w-0">
-                                    <p className="text-xs font-medium text-[var(--foreground)] leading-tight line-clamp-2 group-hover:text-[var(--primary)] transition-colors">
-                                      {fileName}
-                                    </p>
-                                    {doc.bronZipLabel && (
-                                      <p className="text-[9px] text-[var(--muted-foreground)] mt-0.5 line-clamp-1">Uit: {doc.bronZipLabel}</p>
+                                    {FEATURE_DOCUMENT_FORM_FILL && canFill && id && (
+                                      <FillStatusBadge
+                                        tenderId={id}
+                                        documentNaam={doc.naam}
+                                        refreshKey={fillRefreshKey}
+                                        compact
+                                        className="ml-1"
+                                      />
                                     )}
-                                    <div className="mt-1.5 flex items-center gap-1 text-[10px] text-[var(--primary)] opacity-0 group-hover:opacity-100 transition-opacity">
-                                      <Eye className="h-3 w-3" /> Openen
+                                  </p>
+                                  {FEATURE_DOCUMENT_FORM_FILL && canFill && id && (
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation()
+                                        useAgentStore.getState().openWizard(id, doc.naam)
+                                      }}
+                                      className="inline-flex items-center gap-1 rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-[10px] font-medium text-blue-700 hover:bg-blue-100"
+                                      title="Open invul-wizard"
+                                    >
+                                      <Sparkles className="h-3 w-3" /> Invullen
+                                    </button>
+                                  )}
+                                </div>
+                                <div className="flex items-start gap-2 px-3 pb-1">
+                                  <input
+                                    type="checkbox"
+                                    checked={catalogSelectedKeysSet.has(docKey)}
+                                    onChange={(e) => {
+                                      e.stopPropagation()
+                                      void toggleCatalogDocKey(docKey, e.target.checked)
+                                    }}
+                                    onClick={(e) => e.stopPropagation()}
+                                    className="mt-2 h-3.5 w-3.5 shrink-0 rounded border-[var(--border)] accent-[var(--primary)]"
+                                    aria-label={`Selecteren (filter of verwijderen): ${fileName}`}
+                                  />
+                                  <button
+                                    type="button"
+                                    title={isLocal ? doc.localNaam : doc.url}
+                                    onClick={() => {
+                                      setBronPreview(null)
+                                      if (isLocal && doc.localNaam) {
+                                        void handleLocalFileClick({ naam: doc.localNaam, size: localSize })
+                                      } else if (doc.url) {
+                                        setLocalPreviewFile(null)
+                                        setBronPreview({ url: doc.url, naam: fileName })
+                                      }
+                                    }}
+                                    className="flex min-w-0 flex-1 items-start gap-3 py-0.5 text-left hover:bg-[var(--muted)]/50 transition-colors rounded-md"
+                                  >
+                                    <div className="mt-0.5 flex-shrink-0">{getFileIcon(fileName, doc.type)}</div>
+                                    <div className="flex-1 min-w-0">
+                                      <p className={`text-xs font-medium leading-tight line-clamp-2 group-hover:text-[var(--primary)] transition-colors ${isNieuwDoc ? 'text-red-700 dark:text-red-400 font-semibold' : 'text-[var(--foreground)]'}`}>
+                                        {fileName}
+                                      </p>
+                                      {doc.bronZipLabel && (
+                                        <p className="text-[9px] text-[var(--muted-foreground)] mt-0.5 line-clamp-1">Uit: {doc.bronZipLabel}</p>
+                                      )}
+                                      <div className="mt-1.5 flex items-center gap-1 text-[10px] text-[var(--primary)] opacity-0 group-hover:opacity-100 transition-opacity">
+                                        <Eye className="h-3 w-3" /> Openen
+                                      </div>
                                     </div>
-                                  </div>
-                                </button>
+                                  </button>
+                                </div>
                               </div>
                             )
                           })}
@@ -1996,9 +2575,29 @@ export function TenderDetailPage() {
                   )}
                 </div>
               )}
+              {documenten.length > 0 && docCatalogWeergave === 'invul' && invulDocumenten.length === 0 && (
+                <p className="border-b border-[var(--border)] px-3 py-3 text-[10px] leading-snug text-[var(--muted-foreground)]">
+                  Geen invuldocumenten herkend in deze selectie. Kies <strong>Alles</strong> of <strong>Inlichting</strong> om
+                  alle bijlagen te zien.
+                </p>
+              )}
+              {documenten.length > 0 && docCatalogWeergave === 'inlichting' && informatieDocumenten.length === 0 && showBronFilesInCatalog && filteredBronFileLinks.length === 0 && (
+                <p className="border-b border-[var(--border)] px-3 py-3 text-[10px] leading-snug text-[var(--muted-foreground)]">
+                  Geen inlichtingsdocumenten in de catalogus.{' '}
+                  {FEATURE_DOCUMENT_FORM_FILL ? (
+                    <>
+                      Kies <strong>Alles</strong> of <strong>Invul</strong>, of bekijk bronlinks hieronder zodra die beschikbaar zijn.
+                    </>
+                  ) : (
+                    <>
+                      Kies <strong>Alles</strong> of bekijk bronlinks hieronder zodra die beschikbaar zijn.
+                    </>
+                  )}
+                </p>
+              )}
 
               {/* Bestandslinks gevonden in bronpagina (bronNavLinks met bestandsextensie) */}
-              {filteredBronFileLinks.length > 0 && (
+              {showBronFilesInCatalog && filteredBronFileLinks.length > 0 && (
                 <div className={documenten.length > 0 ? 'border-t border-[var(--border)]' : ''}>
                   <p className="px-3 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--muted-foreground)]">
                     Gevonden op bronpagina
@@ -2006,9 +2605,21 @@ export function TenderDetailPage() {
                   <div className="divide-y divide-[var(--border)]">
                     {filteredBronFileLinks.map((link, i) => {
                       const fileName = link.titel || decodeURIComponent(link.url.split('/').pop()?.split('?')[0] || `Bestand ${i + 1}`)
+                      const bKey = bronFileLinkStableKey(link.url)
                       return (
                         <div key={`bfl-${i}`} className="group">
-                          <div className="flex w-full items-start gap-3 px-3 py-3">
+                          <div className="flex w-full items-start gap-2 px-3 py-3">
+                            <input
+                              type="checkbox"
+                              checked={catalogSelectedKeysSet.has(bKey)}
+                              onChange={(e) => {
+                                e.stopPropagation()
+                                void toggleCatalogDocKey(bKey, e.target.checked)
+                              }}
+                              onClick={(e) => e.stopPropagation()}
+                              className="mt-1 h-3.5 w-3.5 shrink-0 rounded border-[var(--border)] accent-[var(--primary)]"
+                              aria-label={`Selecteren (filter of verwijderen): ${fileName}`}
+                            />
                             <div className="mt-0.5 flex-shrink-0">{getFileIcon(fileName, link.url.toLowerCase().includes('.pdf') ? 'pdf' : undefined)}</div>
                             <div className="flex-1 min-w-0">
                               <button
@@ -2059,17 +2670,31 @@ export function TenderDetailPage() {
                 </div>
               )}
               {/* Geen zoekresultaten */}
-              {(docSearch.trim() || docTypeFilter) && informatieDocumenten.length === 0 && invulDocumenten.length === 0 && filteredBronFileLinks.length === 0 && (documenten.length > 0 || bronFileLinks.length > 0) && (
+              {(docSearch.trim() || docTypeFilter || docSelectionFilter === 'selected') &&
+                visibleCatalogDocsCount === 0 &&
+                (!showBronFilesInCatalog || filteredBronFileLinks.length === 0) &&
+                (documenten.length > 0 || bronFileLinks.length > 0) && (
                 <div className="px-4 py-6 text-center">
                   <Search className="mx-auto h-6 w-6 text-[var(--muted-foreground)]/30" />
                   <p className="mt-2 text-xs text-[var(--muted-foreground)]">
-                    {docTypeFilter ? `Geen ${docTypeFilter}-documenten gevonden${docSearch.trim() ? ` voor "${docSearch}"` : ''}` : `Geen documenten gevonden voor "${docSearch}"`}
+                    {docSelectionFilter === 'selected'
+                      ? catalogSelectedKeysSet.size === 0
+                        ? 'Geen documenten geselecteerd. Vink er een of meer aan, of zet «Geselecteerd» uit.'
+                        : docTypeFilter
+                          ? `Geen geselecteerde ${docTypeFilter}-documenten${docSearch.trim() ? ` voor "${docSearch}"` : ''}`
+                          : docSearch.trim()
+                            ? `Geen geselecteerde documenten voor "${docSearch}"`
+                            : 'Geen geselecteerde documenten voldoen aan dit filter.'
+                      : docTypeFilter
+                        ? `Geen ${docTypeFilter}-documenten gevonden${docSearch.trim() ? ` voor "${docSearch}"` : ''}`
+                        : `Geen documenten gevonden voor "${docSearch}"`}
                   </p>
                 </div>
               )}
+
             </div>
 
-            {/* Source link */}
+            {/* Bronlink vast onder de catalogus (niet in de lijst-scroll) */}
             {t.bron_url && (
               <div className="shrink-0 border-t border-[var(--border)] px-3 py-3">
                 <a
@@ -2155,9 +2780,32 @@ export function TenderDetailPage() {
             )}
           </div>
         </div>
-        )}
-
-      </div>
+        </div>
+      ) : (
+        <div className="flex min-h-0 flex-1 flex-col">
+          <div className="min-h-0 flex-1 overflow-y-auto space-y-6">
+            {activeTab === 'risico' && (
+              <RisicoTab
+                aanbestedingId={id!}
+                risicoAnalyseJson={t.risico_analyse}
+                risicoAnalyseAt={t.risico_analyse_at}
+                risicoAnalyseV2Json={t.risico_analyse_v2}
+                risicoWachtrijPositie={risicoWachtrijPositie}
+                onRefresh={refresh}
+              />
+            )}
+            {activeTab === 'inschrijving' && (
+              <InschrijvingTab
+                tender={t}
+                procedureContext={procedureContext}
+                aiExtracted={aiExtracted}
+                criteriaScores={criteriaScores}
+                bronNavLinks={bronNavLinks}
+              />
+            )}
+          </div>
+        </div>
+      )}
     </div>
   )
 }

@@ -1,12 +1,14 @@
-import { Menu, Bell, Moon, Sun } from 'lucide-react'
+import { Menu, Moon, Sun } from 'lucide-react'
 import { useLocation } from 'react-router-dom'
 import vdkLogoDark from '../../assets/vdk-logo-dark.svg'
 import { useThemeStore } from '../../stores/theme-store'
+import { TenderUpdatesBell } from '../tender-updates-modal'
 
 const pageTitles: Record<string, string> = {
   '/': 'Dashboard',
   '/aanbestedingen': 'Aanbestedingen',
   '/aanbestedingskalender': 'Aanbestedingskalender',
+  '/kaart': 'Kaart',
   '/tracking': 'Tracking',
   '/bronnen': 'Bronnen',
   '/criteria': 'Criteria',
@@ -16,9 +18,11 @@ const pageTitles: Record<string, string> = {
 
 interface HeaderProps {
   onToggleSidebar: () => void
+  unreadUpdatesCount: number
+  onOpenUpdates: () => void
 }
 
-export function Header({ onToggleSidebar }: HeaderProps) {
+export function Header({ onToggleSidebar, unreadUpdatesCount, onOpenUpdates }: HeaderProps) {
   const location = useLocation()
   const currentPath = location.pathname
   const title = pageTitles[currentPath] || (currentPath.startsWith('/aanbestedingen/') ? 'Aanbesteding Details' : 'TenderTracker')
@@ -60,9 +64,7 @@ export function Header({ onToggleSidebar }: HeaderProps) {
             : <Moon className="h-5 w-5" />
           }
         </button>
-        <button className="relative rounded-lg p-2 hover:bg-[var(--muted)] transition-colors">
-          <Bell className="h-5 w-5 text-[var(--muted-foreground)]" />
-        </button>
+        <TenderUpdatesBell unreadCount={unreadUpdatesCount} onClick={onOpenUpdates} />
       </div>
     </header>
   )

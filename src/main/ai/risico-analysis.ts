@@ -30,6 +30,9 @@ const SINGLE_PASS_MAX_CHARS = 340_000
 const MOONSHOT_BASE = 'https://api.moonshot.cn/v1'
 const RISICO_MODEL = 'kimi-k2.6'
 
+/** OpenAI reasoning-modellen: geen temperature, max_completion_tokens, developer-rol. */
+const OPENAI_REASONING_MODELS = new Set(['o3', 'o4-mini', 'o3-mini', 'o1', 'o1-mini', 'o1-preview'])
+
 /** Voortgang naar renderer (risico-IPC / activiteitenpaneel). */
 export type RisicoProgressReporter = (step: string, percentage: number) => void
 
@@ -68,16 +71,16 @@ export type RisicoChatFn = (
 ) => Promise<string>
 
 function kimiFetchOptionsForPhase(phase: RisicoChatPhase): FetchWithRetryOptions {
-  // Strak geconfigureerd (2026-04-19) zodat een trage/haperende Moonshot-call
+  // Strak geconfigureerd zodat een trage/haperende Moonshot-call
   // snel richting hoofd-AI fallback gaat i.p.v. de hele run te blokkeren.
   if (phase === 'merge') {
     return { maxAttempts: 2, baseDelayMs: 1200, maxDelayMs: 6_000, timeoutPerAttemptMs: 90_000 }
   }
   if (phase === 'extract') {
-    return { maxAttempts: 3, baseDelayMs: 1200, maxDelayMs: 8_000, timeoutPerAttemptMs: 120_000 }
+    return { maxAttempts: 2, baseDelayMs: 1200, maxDelayMs: 8_000, timeoutPerAttemptMs: 120_000 }
   }
-  // 'single' en 'final' delen hetzelfde budget: grote response mag wat langer.
-  return { maxAttempts: 3, baseDelayMs: 1500, maxDelayMs: 10_000, timeoutPerAttemptMs: 240_000 }
+  // 'single' en 'final': maximaal 1 retry zodat fallback snel plaatsvindt bij grote calls.
+  return { maxAttempts: 2, baseDelayMs: 2000, maxDelayMs: 5_000, timeoutPerAttemptMs: 150_000 }
 }
 
 async function kimiChat(
@@ -143,10 +146,208 @@ async function kimiChat(
   return content
 }
 
+// ---------------------------------------------------------------------------
+// OpenAI direct provider (voor top-tier model override)
+// ---------------------------------------------------------------------------
+
+function openaiTimeoutForModel(model: string): number {
+  if (model === 'o3') return 600_000
+  if (model.startsWith('o')) return 360_000
+  return 200_000
+}
+
+async function openaiRisicoChat(
+  apiKey: string,
+  model: string,
+  messages: ChatMsg[],
+): Promise<string> {
+  const isReasoning = OPENAI_REASONING_MODELS.has(model)
+  const endpoint = 'https://api.openai.com/v1/chat/completions'
+
+  // Reasoning models use 'developer' role instead of 'system'
+  const apiMessages = isReasoning
+    ? messages.map((m) => ({ role: m.role === 'system' ? ('developer' as const) : m.role, content: m.content }))
+    : messages
+
+  const body: Record<string, unknown> = {
+    model,
+    messages: apiMessages,
+    response_format: { type: 'json_object' },
+  }
+  if (isReasoning) {
+    body.max_completion_tokens = 16000
+    // No temperature for reasoning models
+  } else {
+    body.max_tokens = 16384
+    body.temperature = 0.3
+  }
+
+  const timeoutMs = openaiTimeoutForModel(model)
+  const inputChars = messages.reduce((n, m) => n + m.content.length, 0)
+  log.info(
+    `[risico] OpenAI ${model} POST — ~${Math.round(inputChars / 1000)}k tekens, timeout ${Math.round(timeoutMs / 1000)}s, isReasoning=${isReasoning}`,
+  )
+
+  let response: Response
+  try {
+    response = await fetchWithRetry(
+      endpoint,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify(body),
+      },
+      { maxAttempts: 2, baseDelayMs: 3000, maxDelayMs: 15_000, timeoutPerAttemptMs: timeoutMs },
+    )
+  } catch (e) {
+    throw formatFetchFailure(e, `OpenAI ${model} niet bereikbaar`, endpoint)
+  }
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '(fouttekst niet leesbaar)')
+    throw new Error(`OpenAI ${model} fout ${response.status}: ${String(errText).slice(0, 500)}`)
+  }
+
+  log.info(`[risico] OpenAI ${model}: HTTP OK — antwoord binnenhalen…`)
+  const data = (await readResponseJsonWithTimeout(
+    response,
+    timeoutMs,
+    `OpenAI ${model} JSON-antwoord`,
+  )) as { choices?: Array<{ message?: { content?: string } }> }
+  const { input, output } = normalizeUsageFromApiBody(data)
+  logTokenUsage(`OpenAI (risico)`, model, input, output)
+  const content = data.choices?.[0]?.message?.content ?? ''
+  log.info(`[risico] OpenAI ${model}: antwoord ontvangen (${content.length} tekens)`)
+  return content
+}
+
 /** Fallback: gebruik de geconfigureerde hoofd-AI (importeer lazily om circular deps te vermijden). */
 async function fallbackChat(messages: ChatMsg[]): Promise<string> {
   const { aiService } = await import('./ai-service')
   return aiService.chat(messages, { preferJsonOutput: true })
+}
+
+// ---------------------------------------------------------------------------
+// Claude (Anthropic) direct provider (voor top-tier model override)
+// ---------------------------------------------------------------------------
+
+async function claudeRisicoChat(
+  apiKey: string,
+  model: string,
+  messages: ChatMsg[],
+): Promise<string> {
+  const endpoint = 'https://api.anthropic.com/v1/messages'
+  const systemMessage = messages.find((m) => m.role === 'system')?.content ?? ''
+  const userMessages = messages
+    .filter((m) => m.role !== 'system')
+    .map((m) => ({ role: m.role, content: m.content }))
+
+  const isOpus = model.includes('opus')
+  const timeoutMs = isOpus ? 360_000 : 240_000
+  const inputChars = messages.reduce((n, m) => n + m.content.length, 0)
+  log.info(
+    `[risico] Claude ${model} POST — ~${Math.round(inputChars / 1000)}k tekens, timeout ${Math.round(timeoutMs / 1000)}s`,
+  )
+
+  let response: Response
+  try {
+    response = await fetchWithRetry(
+      endpoint,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: 16000,
+          system: systemMessage,
+          messages: userMessages,
+        }),
+      },
+      { maxAttempts: 2, baseDelayMs: 3000, maxDelayMs: 15_000, timeoutPerAttemptMs: timeoutMs },
+    )
+  } catch (e) {
+    throw formatFetchFailure(e, `Claude ${model} niet bereikbaar`, endpoint)
+  }
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '(fouttekst niet leesbaar)')
+    throw new Error(`Claude ${model} fout ${response.status}: ${String(errText).slice(0, 500)}`)
+  }
+
+  log.info(`[risico] Claude ${model}: HTTP OK — antwoord binnenhalen…`)
+  const data = (await readResponseJsonWithTimeout(
+    response,
+    timeoutMs,
+    `Claude ${model} JSON-antwoord`,
+  )) as { content?: Array<{ text?: string }> }
+  const { input, output } = normalizeUsageFromApiBody(data)
+  logTokenUsage(`Claude (risico)`, model, input, output)
+  const content = data.content?.[0]?.text ?? ''
+  log.info(`[risico] Claude ${model}: antwoord ontvangen (${content.length} tekens)`)
+  return content
+}
+
+/**
+ * Google Gemini 2.5 Flash voor risico-inventarisatie.
+ * Gebruikt de native generateContent API; system-instructie apart.
+ * `responseMimeType: 'application/json'` geeft directe JSON-output.
+ */
+async function geminiRisicoChat(
+  apiKey: string,
+  model: string,
+  messages: ChatMsg[],
+): Promise<string> {
+  const systemMsg = messages.find((m) => m.role === 'system')?.content ?? ''
+  const conversationMsgs = messages.filter((m) => m.role !== 'system')
+
+  const contents = conversationMsgs.map((m) => ({
+    role: m.role === 'assistant' ? 'model' : 'user',
+    parts: [{ text: m.content }],
+  }))
+
+  const body: Record<string, unknown> = {
+    contents,
+    generationConfig: {
+      maxOutputTokens: 65536,
+      responseMimeType: 'application/json',
+    },
+  }
+  if (systemMsg) {
+    body.systemInstruction = { parts: [{ text: systemMsg }] }
+  }
+
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`
+  const inputChars = messages.reduce((n, m) => n + m.content.length, 0)
+  log.info(`[risico] Gemini ${model} POST — ~${Math.round(inputChars / 1000)}k tekens`)
+
+  let response: Response
+  try {
+    response = await fetchWithRetry(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }, { maxAttempts: 3, retryDelaysMs: [0, 8_000, 20_000], timeoutPerAttemptMs: 300_000 })
+  } catch (e) {
+    throw formatFetchFailure(e, 'Google Gemini API niet bereikbaar', endpoint)
+  }
+
+  if (!response.ok) {
+    const errText = await response.text()
+    throw new Error(`Google Gemini API error: ${response.status} - ${errText.slice(0, 500)}`)
+  }
+
+  const data = (await readResponseJsonWithTimeout(response, 300_000, `Gemini ${model} JSON`)) as {
+    candidates?: { content?: { parts?: { text?: string }[] } }[]
+    usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number }
+  }
+  const inputTokens = data.usageMetadata?.promptTokenCount ?? 0
+  const outputTokens = data.usageMetadata?.candidatesTokenCount ?? 0
+  logTokenUsage('Google Gemini (risico)', model, inputTokens, outputTokens)
+  return data.candidates?.[0]?.content?.parts?.[0]?.text ?? ''
 }
 
 const MAIN_AI_RETRY_DELAYS_MS = [0, 3500, 14_000]
@@ -169,30 +370,63 @@ async function resilientMainAiChat(messages: ChatMsg[]): Promise<string> {
 }
 
 /**
- * Kimi eerst (indien sleutel), met automatische fallback naar hoofd-AI bij netwerk-/API-fouten
- * zodat chunked extractie niet op `fetch failed` stukloopt.
+ * Kimi eerst (indien sleutel), daarna Gemini, dan hoofd-AI fallback.
+ * Als `openaiModel`/`openaiApiKey` of `claudeModel`/`claudeApiKey` zijn opgegeven worden die gebruikt.
  */
 function buildRisicoChatFn(
   useKimi: boolean,
   moonshotApiKey: string | undefined,
   baseUrl: string,
+  openaiModel?: string,
+  openaiApiKey?: string,
+  claudeModel?: string,
+  claudeApiKey?: string,
+  geminiApiKey?: string,
+  geminiModel?: string,
 ): RisicoChatFn {
   return async (messages, meta) => {
     const phase = meta?.phase ?? 'final'
     const sysLen = messages[0]?.content?.length ?? 0
     const userLen = messages[messages.length - 1]?.content?.length ?? 0
     log.info(`[risico] LLM-call phase=${phase} systemChars=${sysLen} userChars=${userLen}`)
-    if (useKimi && moonshotApiKey) {
+
+    // Claude top-tier model override
+    if (claudeModel && claudeApiKey) {
+      return claudeRisicoChat(claudeApiKey, claudeModel, messages)
+    }
+
+    // OpenAI top-tier model override
+    if (openaiModel && openaiApiKey) {
+      return openaiRisicoChat(openaiApiKey, openaiModel, messages)
+    }
+
+    // Google Gemini — 1M context, directe voorkeur boven Kimi voor risico-analyse
+    // (Kimi max 262K tokens; grote dossiers passen er niet in)
+    if (geminiApiKey) {
       try {
-        return await kimiChat(moonshotApiKey, baseUrl, messages, kimiFetchOptionsForPhase(phase))
+        return await geminiRisicoChat(geminiApiKey, geminiModel || 'gemini-2.5-flash', messages)
       } catch (e) {
         log.warn(
-          '[risico] Kimi (Moonshot) faalde na retries — zelfde prompt via hoofd-AI:',
+          '[risico] Gemini faalde — fallback naar hoofd-AI:',
           e instanceof Error ? e.message : e,
         )
         return resilientMainAiChat(messages)
       }
     }
+
+    // Kimi (Moonshot) — 128K context, alleen als Gemini niet geconfigureerd is
+    if (useKimi && moonshotApiKey) {
+      try {
+        return await kimiChat(moonshotApiKey, baseUrl, messages, kimiFetchOptionsForPhase(phase))
+      } catch (e) {
+        log.warn(
+          '[risico] Kimi (Moonshot) faalde na retries — fallback naar hoofd-AI:',
+          e instanceof Error ? e.message : e,
+        )
+        return resilientMainAiChat(messages)
+      }
+    }
+
     return resilientMainAiChat(messages)
   }
 }
@@ -411,6 +645,18 @@ export interface RisicoAnalysisConfig {
   /** Moonshot API key — als aanwezig, altijd Kimi k2.6 gebruiken. */
   moonshotApiKey?: string
   moonshotBaseUrl?: string
+  /** Google Gemini API key — gebruikt als Kimi niet beschikbaar is. */
+  geminiApiKey?: string
+  /** Gemini model (default: gemini-2.5-flash). */
+  geminiModel?: string
+  /** Top-tier OpenAI model override voor eenmalige heranalyse (bijv. 'o3', 'o4-mini', 'gpt-4.1'). */
+  openaiModelOverride?: string
+  /** OpenAI API-sleutel voor de model override. */
+  openaiApiKey?: string
+  /** Anthropic Claude model override voor eenmalige heranalyse (bijv. 'claude-opus-4-7', 'claude-sonnet-4-6'). */
+  claudeModelOverride?: string
+  /** Anthropic API-sleutel voor de Claude model override. */
+  claudeApiKey?: string
   /** Optioneel: elke deelstap voor UI (voortgang + activiteitenlog). */
   onProgress?: RisicoProgressReporter
 }
@@ -432,15 +678,35 @@ export async function runRisicoAnalysisCore(
     return null
   }
 
-  const useKimi = !!config.moonshotApiKey
+  const useClaude = !!(config.claudeModelOverride && config.claudeApiKey)
+  const useOpenAI = !useClaude && !!(config.openaiModelOverride && config.openaiApiKey)
+  const useKimi = !useClaude && !useOpenAI && !!config.moonshotApiKey
   const baseUrl = config.moonshotBaseUrl || MOONSHOT_BASE
 
-  const chatFn = buildRisicoChatFn(useKimi, config.moonshotApiKey, baseUrl)
+  const chatFn = buildRisicoChatFn(
+    useKimi,
+    config.moonshotApiKey,
+    baseUrl,
+    useOpenAI ? config.openaiModelOverride : undefined,
+    useOpenAI ? config.openaiApiKey : undefined,
+    useClaude ? config.claudeModelOverride : undefined,
+    useClaude ? config.claudeApiKey : undefined,
+    config.geminiApiKey,
+    config.geminiModel,
+  )
 
   /** Minder gelijktijdige TLS-verbindingen naar Moonshot vermindert `fetch failed` in Electron. */
   const chunkConcurrency = useKimi
     ? Math.min(2, LLM_CHUNK_EXTRACTION_CONCURRENCY)
     : LLM_CHUNK_EXTRACTION_CONCURRENCY
+
+  const providerLabel = useClaude
+    ? `Claude ${config.claudeModelOverride}`
+    : useOpenAI
+      ? `OpenAI ${config.openaiModelOverride}`
+      : useKimi
+        ? 'Kimi k2.6'
+        : 'hoofd-AI'
 
   const tenderContext = [
     `Aanbesteding: ${tender.titel}`,
@@ -452,7 +718,7 @@ export async function runRisicoAnalysisCore(
   ].filter(Boolean).join('\n')
 
   const totalChars = documentTexts.reduce((s, t) => s + t.length, 0)
-  log.info(`[risico] Start analyse: ${documentTexts.length} blokken, ${Math.round(totalChars / 1000)}k tekens, provider=${useKimi ? 'Kimi k2.6' : 'hoofd-AI'}`)
+  log.info(`[risico] Start analyse: ${documentTexts.length} blokken, ${Math.round(totalChars / 1000)}k tekens, provider=${providerLabel}`)
 
   const report = config.onProgress
 
@@ -647,4 +913,26 @@ export async function runRisicoAnalysisCore(
     report?.('Chunked analyse: inventarisatie gevalideerd', 88)
   }
   return result
+}
+
+/**
+ * Bouw een RisicoChatFn vanuit een RisicoAnalysisConfig.
+ * Geëxporteerd zodat de V2 orchestrator dezelfde chatFn kan gebruiken.
+ */
+export function buildRisicoChatFnFromConfig(config: RisicoAnalysisConfig): RisicoChatFn {
+  const useClaude = !!(config.claudeModelOverride && config.claudeApiKey)
+  const useOpenAI = !useClaude && !!(config.openaiModelOverride && config.openaiApiKey)
+  const useKimi = !useClaude && !useOpenAI && !!config.moonshotApiKey
+  const baseUrl = config.moonshotBaseUrl || MOONSHOT_BASE
+  return buildRisicoChatFn(
+    useKimi,
+    config.moonshotApiKey,
+    baseUrl,
+    useOpenAI ? config.openaiModelOverride : undefined,
+    useOpenAI ? config.openaiApiKey : undefined,
+    useClaude ? config.claudeModelOverride : undefined,
+    useClaude ? config.claudeApiKey : undefined,
+    config.geminiApiKey,
+    config.geminiModel,
+  )
 }

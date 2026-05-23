@@ -3,6 +3,8 @@ import { getDb } from '../db/connection'
 import { IPC } from '../../shared/constants'
 import { runScrapePipeline } from '../scraping/pipeline'
 import { enqueuePostScrapeAnalysis } from './analysis.ipc'
+import { filterTenderIdsForAutoPostScrapeAnalysis } from '../utils/post-scrape-auto-analysis-filter'
+import { runScheduledLoginButtonClicks } from '../scheduler/scheduled-scrape-prepare'
 import { getMainWindow } from '../index'
 import log from 'electron-log'
 import { acquireBusyWorkBlocker, releaseBusyWorkBlocker } from '../utils/busy-work-blocker'
@@ -107,6 +109,79 @@ export function isDocumentFetchResumeActive(): boolean {
   return documentFetchResumeActive
 }
 
+/**
+ * Achtergrondtaak voor handmatige URL-verwerking.
+ * Loopt volledig in het main-process ongeacht navigatie in de renderer.
+ * Stuurt voortgang via IPC.TENDERS_PROCESS_URL_PROGRESS.
+ * Het laatste bericht bevat { done: true } en het eindresultaat.
+ */
+async function runProcessUrlBackgroundJob(
+  tenderId: string,
+  placeholderTitel: string,
+  settingsMap: Record<string, string>,
+): Promise<void> {
+  acquireBusyWorkBlocker('process-url')
+  const db = getDb()
+
+  const sendProgress = (step: string, percentage: number, extra?: Record<string, unknown>) => {
+    const mainWindow = getMainWindow()
+    mainWindow?.webContents.send(IPC.TENDERS_PROCESS_URL_PROGRESS, { step, percentage, ...extra })
+  }
+
+  try {
+    sendProgress('Aanbesteding aangemaakt — documenten ophalen…', 5)
+
+    // Document-discovery
+    try {
+      await discoverDocumentsFromBronWithAi(tenderId, settingsMap, (p) => {
+        sendProgress(p.step, 5 + Math.round(p.percentage * 0.65))
+      })
+    } catch (err: unknown) {
+      log.warn(`[process-url] Document-discovery fout voor ${tenderId}:`, err)
+    }
+
+    // Controleer of er documenten gevonden zijn
+    const refreshed = db
+      .prepare('SELECT titel, document_urls FROM aanbestedingen WHERE id = ?')
+      .get(tenderId) as { titel: string; document_urls: string | null } | undefined
+
+    const hasDocuments = (() => {
+      try {
+        const arr = JSON.parse(refreshed?.document_urls || '[]')
+        return Array.isArray(arr) && arr.length > 0
+      } catch { return false }
+    })()
+
+    const autoIds = await filterTenderIdsForAutoPostScrapeAnalysis([tenderId])
+    if (autoIds.length > 0) {
+      sendProgress('Documenten opgehaald — AI-analyse in wachtrij gezet…', 85)
+      enqueuePostScrapeAnalysis(autoIds)
+    } else {
+      sendProgress(
+        'Documenten opgehaald — geen automatische AI (buiten werkgebied, geen locatie of uitgeschakeld). Start analyse handmatig op de detailpagina.',
+        85,
+      )
+    }
+
+    const tenderTitel = refreshed?.titel || placeholderTitel
+    log.info(`[process-url] Achtergrond voltooid voor ${tenderId}. Documenten: ${hasDocuments}`)
+
+    // Eindmelding — done: true signaleert de renderer dat het werk klaar is
+    sendProgress('Verwerking voltooid — analyse loopt op de achtergrond', 100, {
+      done: true,
+      tenderId,
+      tenderTitel,
+      hasDocuments,
+    })
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err)
+    log.error(`[process-url] Achtergrondtaak mislukt voor ${tenderId}:`, err)
+    sendProgress(`Fout: ${msg}`, 100, { done: true, error: true, errorMessage: msg })
+  } finally {
+    releaseBusyWorkBlocker('process-url')
+  }
+}
+
 export function registerScrapingHandlers(): void {
   ipcMain.handle(IPC.SCRAPING_START, async (_event, options: { sourceIds?: string[], zoektermen?: string[] }) => {
     if (scrapingActive) {
@@ -130,17 +205,46 @@ export function registerScrapingHandlers(): void {
       ?? (db.prepare('SELECT term FROM zoektermen WHERE is_actief = 1 ORDER BY volgorde').all() as { term: string }[]).map(z => z.term)
 
     const mainWindow = getMainWindow()
+    const toRun = sources as any[]
+
+    if (toRun.length === 0) {
+      scrapingActive = false
+      return {
+        success: false,
+        error:
+          'Geen actieve bronnen. Voeg bronnen toe of zet een bron weer actief (menu Bronnen).',
+      }
+    }
+
+    try {
+      await runScheduledLoginButtonClicks(toRun, {
+        progressJobId: 'manual-prep',
+        onProgress: (p) => {
+          mainWindow?.webContents.send(IPC.SCRAPING_PROGRESS, p)
+        },
+      })
+    } catch (prepErr: any) {
+      log.warn('[tracking] Voorbereiding inlogacties (handmatig):', prepErr)
+    }
 
     try {
       const results = await runScrapePipeline(
-        sources as any[],
+        toRun,
         zoektermen,
         (progress) => {
           mainWindow?.webContents.send(IPC.SCRAPING_PROGRESS, progress)
-        }
+        },
+        { triggeredBy: 'manual' },
       )
       if (results.newTenderIds.length > 0) {
-        enqueuePostScrapeAnalysis(results.newTenderIds)
+        const autoIds = await filterTenderIdsForAutoPostScrapeAnalysis(results.newTenderIds)
+        if (autoIds.length > 0) {
+          enqueuePostScrapeAnalysis(autoIds)
+        } else {
+          log.info(
+            `[tracking] ${results.newTenderIds.length} nieuwe aanbesteding(en) — geen automatische AI-wachtrij (werkgebied-filter of "Verwerk meteen analyse" uit).`,
+          )
+        }
       }
       return { success: true, results }
     } catch (error: any) {
@@ -158,7 +262,13 @@ export function registerScrapingHandlers(): void {
   })
 
   ipcMain.handle(IPC.SCRAPING_JOBS, () => {
-    return getDb().prepare('SELECT * FROM scrape_jobs ORDER BY created_at DESC LIMIT 50').all()
+    return getDb()
+      .prepare(
+        `SELECT * FROM scrape_jobs
+         ORDER BY COALESCE(completed_at, started_at, created_at) DESC
+         LIMIT 50`,
+      )
+      .all()
   })
 
   ipcMain.handle(IPC.SCRAPING_PENDING_DOCUMENT_FETCH, () => {
@@ -222,4 +332,68 @@ export function registerScrapingHandlers(): void {
       return { success: true, deleted: r.changes }
     },
   )
+
+  /**
+   * Verwerk een handmatig ingevoerde URL als aanbesteding.
+   *
+   * Fire-and-forget: de IPC-handler valideert de URL en maakt het DB-record aan,
+   * retourneert meteen { started, tenderId } en laat het zware werk (document-discovery
+   * + analyse-wachtrij) volledig in de achtergrond lopen — ongeacht of de gebruiker
+   * de instellingenpagina verlaat.
+   *
+   * Voortgang wordt gepusht via IPC.TENDERS_PROCESS_URL_PROGRESS.
+   * Het slotbericht bevat { done: true } zodat de renderer de balk kan sluiten.
+   */
+  ipcMain.handle(IPC.TENDERS_PROCESS_URL, async (_event, rawUrl: string) => {
+    // URL valideren
+    let url: string
+    try {
+      url = new URL(rawUrl.trim()).href
+    } catch {
+      return { success: false, error: 'Ongeldige URL. Voer een volledige URL in (inclusief https://).' }
+    }
+
+    const db = getDb()
+
+    // Bestaat deze URL al?
+    const existing = db
+      .prepare('SELECT id, titel FROM aanbestedingen WHERE bron_url = ?')
+      .get(url) as { id: string; titel: string } | undefined
+    if (existing) {
+      return {
+        success: false,
+        alreadyExists: true,
+        tenderId: existing.id,
+        tenderTitel: existing.titel,
+        error: `Deze aanbesteding staat al in de lijst: "${existing.titel}"`,
+      }
+    }
+
+    // Nieuw tender-record aanmaken (minimale info — details worden ingevuld na discovery)
+    const newId = crypto.randomUUID().replace(/-/g, '')
+    const hostname = new URL(url).hostname.replace(/^www\./, '')
+    const placeholderTitel = `Aanbesteding van ${hostname}`
+
+    db.prepare(`
+      INSERT INTO aanbestedingen
+        (id, titel, bron_url, bron_website_naam, status)
+      VALUES (?, ?, ?, ?, 'gevonden')
+    `).run(newId, placeholderTitel, url, hostname)
+
+    log.info(`[process-url] Nieuw record aangemaakt: ${newId} voor ${url}`)
+
+    // Instellingen ophalen vóór we returnen zodat de achtergrondtaak geen async DB-race heeft
+    const settingsRows = db.prepare('SELECT key, value FROM app_settings').all() as { key: string; value: string }[]
+    const settingsMap: Record<string, string> = {}
+    settingsRows.forEach((r) => { settingsMap[r.key] = r.value })
+
+    // Achtergrondtaak starten — bewust niet awaiten zodat de renderer meteen een antwoord krijgt
+    void runProcessUrlBackgroundJob(newId, placeholderTitel, settingsMap)
+
+    return {
+      started: true,
+      tenderId: newId,
+      tenderTitel: placeholderTitel,
+    }
+  })
 }

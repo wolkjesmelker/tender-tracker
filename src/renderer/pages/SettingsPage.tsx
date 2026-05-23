@@ -1,21 +1,25 @@
 import { useState, useEffect, useRef } from 'react'
-import { useSettings, useSchedules, useZoektermen } from '../hooks/use-ipc'
+import { useSettings, useSchedules, useZoektermen, useSources } from '../hooks/use-ipc'
 import { api, isElectron } from '../lib/ipc-client'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
+import { SettingsPinModal, isSettingsPinUnlocked, isReleaseAdminPinUnlocked } from '../components/settings-pin-modal'
+import { ReleaseAdminSection } from '../components/ReleaseAdminSection'
 import {
-  Brain, Key, Server, Clock, Search, Save, Plus, Trash2, X,
-  CheckCircle2, AlertCircle, RefreshCw, Loader2, Cloud, FolderOpen,
-  MessageSquareText, Stethoscope, Building2,
+  Clock, Search, Save, Plus, Trash2, X,
+  CheckCircle2, AlertCircle, RefreshCw, Loader2, Cloud, CloudUpload, FolderOpen,
+  MessageSquareText, Stethoscope, Building2, Link2, Play, ExternalLink, Rocket,
 } from 'lucide-react'
 import {
+  APP_SETTING_DOC_FILL_PROMPT,
   APP_SETTING_RISICO_PROMPT_EXTRACTIE,
   APP_SETTING_RISICO_PROMPT_HOOFD,
 } from '@shared/constants'
 import { BedrijfsprofielTab } from '../components/BedrijfsprofielTab'
+import { FEATURE_DOCUMENT_FORM_FILL } from '../../shared/feature-flags'
 
 type SchedulePatternKind = 'daily' | 'weekdays' | 'weekly' | 'interval'
 
-type SettingsMainTab = 'algemeen' | 'prompts' | 'bedrijven'
+type SettingsMainTab = 'algemeen' | 'prompts' | 'bedrijven' | 'versiebeheer'
 
 type AIPromptRow = {
   id: string
@@ -40,7 +44,17 @@ function buildCronExpression(
   if (pattern === 'interval') {
     const h = intervalHours
     if (!Number.isFinite(h) || h < 1 || h > 23) return null
-    return `0 */${h} * * *`
+    // Unieke uren op de 24u-klok, startend bij het gekozen uur (niet alleen 0,6,12,18 bij */6).
+    const seen = new Set<number>()
+    const hours: number[] = []
+    let cur = hour
+    while (!seen.has(cur)) {
+      seen.add(cur)
+      hours.push(cur)
+      cur = (cur + h) % 24
+    }
+    hours.sort((a, b) => a - b)
+    return `${minute} ${hours.join(',')} * * *`
   }
   if (pattern === 'daily') return `${minute} ${hour} * * *`
   if (pattern === 'weekdays') return `${minute} ${hour} * * 1-5`
@@ -85,6 +99,26 @@ function formatNlTimeHm(hour: number, minute: number): string {
 }
 
 /** Oude naam "Scrape" in de database vriendelijk tonen als Tracking. */
+function describeScheduleBronnen(
+  rawIds: string | null | undefined,
+  allBronnen: { id: string; naam: string }[],
+): string {
+  try {
+    const ids = JSON.parse(rawIds || '[]') as string[]
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return 'Alle actieve bronnen (oud schema — geen expliciete keuze)'
+    }
+    const names = ids
+      .map((id) => allBronnen.find((b) => b.id === id)?.naam || id)
+      .filter(Boolean)
+    if (names.length === 0) return `${ids.length} bron(nen)`
+    if (names.length <= 3) return names.join(', ')
+    return `${names.slice(0, 3).join(', ')} +${names.length - 3}`
+  } catch {
+    return 'Bronnen'
+  }
+}
+
 function displayScheduleName(naam: string): string {
   const t = naam?.trim()
   if (t && /^scrape$/i.test(t)) return 'Tracking'
@@ -96,7 +130,17 @@ function describeCron(cron: string): string {
   const parts = raw.split(/\s+/).filter(Boolean)
 
   const m4 = raw.match(/^(\d+) \*\/(\d+) \* \* \*$/)
-  if (m4) return `Elke ${m4[2]} uur (op het hele uur)`
+  if (m4) return `Elke ${m4[2]} uur (op het hele uur — oude schema’s; maak zo nodig opnieuw aan voor je starttijd)`
+
+  const mList = raw.match(/^(\d+) ([\d,]+) \* \* \*$/)
+  if (mList) {
+    const min = mList[1]
+    const hrs = mList[2].split(',').map((x) => parseInt(x, 10)).filter((n) => Number.isFinite(n))
+    if (hrs.length > 1) {
+      const times = hrs.map((h) => formatNlTimeHm(h, parseInt(min, 10)))
+      return `Elke ${hrs.length} runs per dag: ${times.join(', ')}`
+    }
+  }
 
   const parsed = cronMinuteHourDomMonthDow(parts)
   if (parsed && parsed.dom === '*' && parsed.month === '*') {
@@ -115,9 +159,14 @@ function describeCron(cron: string): string {
 }
 
 export function SettingsPage() {
+  const navigate = useNavigate()
+  const [pinUnlocked, setPinUnlocked] = useState(() => isSettingsPinUnlocked())
+  const [releaseAdminUnlocked, setReleaseAdminUnlocked] = useState(() => isReleaseAdminPinUnlocked())
+
   const { data: settings, refresh: refreshSettings } = useSettings()
   const { data: schedules, refresh: refreshSchedules } = useSchedules()
   const { data: zoektermen, refresh: refreshZoektermen } = useZoektermen()
+  const { data: bronWebsites } = useSources()
 
   const [mainTab, setMainTab] = useState<SettingsMainTab>('algemeen')
   const [promptAgentId, setPromptAgentId] = useState<string | null>(null)
@@ -126,21 +175,11 @@ export function SettingsPage() {
   const [promptScorerText, setPromptScorerText] = useState('')
   const [risicoHoofdText, setRisicoHoofdText] = useState('')
   const [risicoExtractieText, setRisicoExtractieText] = useState('')
+  const [docFillPromptText, setDocFillPromptText] = useState('')
   const [promptsLoadError, setPromptsLoadError] = useState<string | null>(null)
   const [promptsSaving, setPromptsSaving] = useState(false)
   const [promptsSaved, setPromptsSaved] = useState(false)
   const promptsLoadedOnce = useRef(false)
-
-  const [provider, setProvider] = useState('moonshot')
-  const [model, setModel] = useState('')
-  const [apiKey, setApiKey] = useState('')
-  const [ollamaEndpoint, setOllamaEndpoint] = useState('http://localhost:11434')
-  const [moonshotApiBase, setMoonshotApiBase] = useState('')
-  const [moonshotApiKey, setMoonshotApiKey] = useState('')
-  const [kimiCliPath, setKimiCliPath] = useState('')
-  const [kimiCliMaxSteps, setKimiCliMaxSteps] = useState('48')
-  const [detectionApiKey, setDetectionApiKey] = useState('')
-  const [saved, setSaved] = useState(false)
 
   const [cloudSyncPath, setCloudSyncPath] = useState('')
   const [cloudSyncEnabled, setCloudSyncEnabled] = useState(false)
@@ -149,6 +188,276 @@ export function SettingsPage() {
   const [cloudSyncNote, setCloudSyncNote] = useState<{ tone: 'ok' | 'warn'; text: string } | null>(null)
   const [cloudManifestText, setCloudManifestText] = useState<string | null>(null)
 
+  // Supabase sync
+  const [sbSyncBusy, setSbSyncBusy] = useState(false)
+  const [sbSyncNote, setSbSyncNote] = useState<{ tone: 'ok' | 'warn'; text: string } | null>(null)
+  const [sbSyncStatus, setSbSyncStatus] = useState<{
+    lastPushAt: string | null
+    lastPullAt: string | null
+    pushCount: number
+    pullCount: number
+    lastError: string | null
+  } | null>(null)
+  const [supabaseFormUrl, setSupabaseFormUrl] = useState('')
+  const [supabaseFormKey, setSupabaseFormKey] = useState('')
+  const [supabaseFormSaving, setSupabaseFormSaving] = useState(false)
+  const [supabaseFormSaved, setSupabaseFormSaved] = useState(false)
+  /** Alleen actief tijdens «Alles uploaden» — toont voortgangsbalk (IPC `sync:progress`). */
+  const [sbFullPushProgress, setSbFullPushProgress] = useState<{ percent: number; label: string } | null>(null)
+
+  /** Supabase «ping» (leestoegang, RLS). */
+  const [sbConnTestBusy, setSbConnTestBusy] = useState(false)
+
+  // ── Handmatige URL-verwerking ──
+  const [processUrl, setProcessUrl] = useState('')
+  const [processUrlBusy, setProcessUrlBusy] = useState(false)
+  const [processUrlStep, setProcessUrlStep] = useState('')
+  const [processUrlPct, setProcessUrlPct] = useState(0)
+  const [processUrlResult, setProcessUrlResult] = useState<{
+    tone: 'ok' | 'warn' | 'info'
+    text: string
+    tenderId?: string
+    tenderTitel?: string
+  } | null>(null)
+
+  // Abonneer permanent op voortgangsberichten vanuit de achtergrondtaak.
+  // De taak loopt door ongeacht navigatie; done: true geeft het eindresultaat.
+  useEffect(() => {
+    if (!isElectron) return
+    const unsub = (api as any).onProcessUrlProgress?.(
+      (data: { step: string; percentage: number; done?: boolean; tenderId?: string; tenderTitel?: string; hasDocuments?: boolean; error?: boolean; errorMessage?: string }) => {
+        setProcessUrlStep(data.step)
+        setProcessUrlPct(data.percentage)
+        if (data.done) {
+          if (data.error) {
+            setProcessUrlResult({ tone: 'warn', text: data.errorMessage || 'Verwerking mislukt.' })
+          } else {
+            setProcessUrlResult({
+              tone: 'ok',
+              text: data.hasDocuments
+                ? `Verwerkt: "${data.tenderTitel}" — documenten gevonden, analyse loopt op de achtergrond.`
+                : `Aangemaakt: "${data.tenderTitel}" — geen documenten gevonden op de bronpagina. Analyse loopt alsnog.`,
+              tenderId: data.tenderId,
+              tenderTitel: data.tenderTitel,
+            })
+          }
+          setProcessUrlBusy(false)
+          setProcessUrlStep('')
+          setProcessUrlPct(0)
+        }
+      },
+    )
+    return () => unsub?.()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isElectron])
+
+  const loadSbSyncStatus = async () => {
+    if (!isElectron || !api.syncGetStatus) return
+    const s = (await api.syncGetStatus()) as {
+      lastPushAt: string | null
+      lastPullAt: string | null
+      pushCount: number
+      pullCount: number
+      lastError: string | null
+    }
+    setSbSyncStatus(s)
+  }
+
+  const handleSbTestConnection = async () => {
+    if (!isElectron || typeof api.syncTestConnection !== 'function') {
+      setSbSyncNote({
+        tone: 'warn',
+        text: 'Test niet beschikbaar. Herstart de app na update.',
+      })
+      return
+    }
+    setSbConnTestBusy(true)
+    setSbSyncNote(null)
+    try {
+      const r = await api.syncTestConnection()
+      if (r.ok) {
+        setSbSyncNote({
+          tone: 'ok',
+          text: 'Verbinding OK — Supabase accepteert lezen vanuit de app (URL, key en RLS).',
+        })
+      } else {
+        setSbSyncNote({
+          tone: 'warn',
+          text: r.error ?? 'Verbinding geweigerd.',
+        })
+      }
+    } catch (e) {
+      setSbSyncNote({
+        tone: 'warn',
+        text: e instanceof Error ? e.message : String(e),
+      })
+    } finally {
+      setSbConnTestBusy(false)
+    }
+  }
+
+  const handleSbSyncNow = async () => {
+    if (!isElectron) return
+    if (typeof api.syncNow !== 'function') {
+      setSbSyncNote({
+        tone: 'warn',
+        text: 'Sync is niet geladen. Herstart de app of gebruik de geïnstalleerde TenderTracker.',
+      })
+      return
+    }
+    setSbSyncBusy(true)
+    setSbSyncNote(null)
+    try {
+      const r = (await api.syncNow()) as {
+        pushCount: number
+        pullCount: number
+        lastError: string | null
+        lastPushAt: string | null
+        lastPullAt: string | null
+      }
+      if (r.lastError) {
+        setSbSyncNote({ tone: 'warn', text: `Sync mislukt: ${r.lastError}` })
+      } else {
+        setSbSyncNote({
+          tone: 'ok',
+          text: `Sync voltooid — ${r.pushCount} rij(en) geüpload, ${r.pullCount} rij(en) gedownload.`,
+        })
+      }
+      void loadSbSyncStatus()
+    } catch (e) {
+      setSbSyncNote({
+        tone: 'warn',
+        text: e instanceof Error ? e.message : `Onverwachte fout: ${String(e)}`,
+      })
+    } finally {
+      setSbSyncBusy(false)
+    }
+  }
+
+  const handleSbFullPull = async () => {
+    if (!isElectron) return
+    if (typeof api.syncFullPull !== 'function') {
+      setSbSyncNote({
+        tone: 'warn',
+        text: 'Cloud-download is niet geladen. Sluit de app en open TenderTracker opnieuw (geïnstalleerde app of actuele `npm run dev`).',
+      })
+      return
+    }
+    setSbSyncBusy(true)
+    setSbSyncNote(null)
+    try {
+      const r = (await api.syncFullPull()) as {
+        pullCount: number
+        lastError: string | null
+        documentPullCount?: number
+        documentPullFailed?: number
+      }
+      if (r.lastError) {
+        setSbSyncNote({ tone: 'warn', text: `Volledige download mislukt: ${r.lastError}` })
+      } else {
+        const doc = r.documentPullCount != null && (r.documentPullCount > 0 || (r.documentPullFailed ?? 0) > 0)
+          ? ` Bijlagen: ${r.documentPullCount ?? 0} opgeslagen${(r.documentPullFailed ?? 0) > 0 ? `, ${r.documentPullFailed} mislukt` : ''}.`
+          : ''
+        setSbSyncNote({
+          tone: 'ok',
+          text: `Klaar — ${r.pullCount} tabelrij(en) opgehaald uit de cloud.${doc}`,
+        })
+      }
+    } catch (e) {
+      setSbSyncNote({
+        tone: 'warn',
+        text: e instanceof Error ? e.message : `Onverwachte fout: ${String(e)}`,
+      })
+    } finally {
+      void loadSbSyncStatus()
+      setSbSyncBusy(false)
+    }
+  }
+
+  const handleSbFullPush = async () => {
+    if (!isElectron) return
+    if (typeof api.syncFullPush !== 'function') {
+      setSbSyncNote({
+        tone: 'warn',
+        text: 'Cloud-upload is niet geladen. Herstart de app of gebruik de geïnstalleerde TenderTracker.',
+      })
+      return
+    }
+    setSbSyncBusy(true)
+    setSbSyncNote(null)
+    setSbFullPushProgress({ percent: 0, label: 'Upload starten…' })
+    const offSyncProgress =
+      typeof api.onSyncProgress === 'function'
+        ? api.onSyncProgress((p) => setSbFullPushProgress(p))
+        : undefined
+    try {
+      const r = (await api.syncFullPush()) as {
+        pushCount: number
+        lastError: string | null
+        documentPushCount?: number
+        documentPushFailed?: number
+      }
+      if (r.lastError) {
+        setSbSyncNote({ tone: 'warn', text: `Volledige upload mislukt: ${r.lastError}` })
+      } else {
+        const doc =
+          r.documentPushCount != null && (r.documentPushCount > 0 || (r.documentPushFailed ?? 0) > 0)
+            ? ` Bijlagen: ${r.documentPushCount ?? 0} naar storage${(r.documentPushFailed ?? 0) > 0 ? `, ${r.documentPushFailed} mislukt` : ''}.`
+            : ''
+        setSbSyncNote({
+          tone: 'ok',
+          text: `Klaar — ${r.pushCount} tabelrij(en) naar Supabase geüpload. Lokale bestanden blijven op schijf.${doc}`,
+        })
+      }
+    } catch (e) {
+      setSbSyncNote({
+        tone: 'warn',
+        text: e instanceof Error ? e.message : `Onverwachte fout: ${String(e)}`,
+      })
+    } finally {
+      offSyncProgress?.()
+      setSbFullPushProgress(null)
+      void loadSbSyncStatus()
+      setSbSyncBusy(false)
+    }
+  }
+
+  useEffect(() => {
+    void loadSbSyncStatus()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    if (!isElectron || typeof api.getSetting !== 'function') return
+    void (async () => {
+      const u = (await api.getSetting('supabase_url')) as string | null
+      const k = (await api.getSetting('supabase_anon_key')) as string | null
+      if (typeof u === 'string') setSupabaseFormUrl(u)
+      if (typeof k === 'string') setSupabaseFormKey(k)
+    })()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isElectron])
+
+  const handleSaveSupabaseConnection = async () => {
+    if (!isElectron || typeof api.setSetting !== 'function') return
+    setSupabaseFormSaving(true)
+    setSupabaseFormSaved(false)
+    setSbSyncNote(null)
+    try {
+      await api.setSetting('supabase_url', supabaseFormUrl.trim())
+      await api.setSetting('supabase_anon_key', supabaseFormKey.trim())
+      setSupabaseFormSaved(true)
+      window.setTimeout(() => setSupabaseFormSaved(false), 2500)
+    } catch (e) {
+      setSbSyncNote({
+        tone: 'warn',
+        text: e instanceof Error ? e.message : `Opslaan mislukt: ${String(e)}`,
+      })
+    } finally {
+      setSupabaseFormSaving(false)
+    }
+  }
+
   const [newTerm, setNewTerm] = useState('')
   const [scheduleModalOpen, setScheduleModalOpen] = useState(false)
   const [modalScheduleName, setModalScheduleName] = useState('')
@@ -156,6 +465,7 @@ export function SettingsPage() {
   const [modalPattern, setModalPattern] = useState<SchedulePatternKind>('weekdays')
   const [modalWeekDay, setModalWeekDay] = useState(1)
   const [modalIntervalHours, setModalIntervalHours] = useState(6)
+  const [modalScheduleBronIds, setModalScheduleBronIds] = useState<string[]>([])
   const [scheduleModalError, setScheduleModalError] = useState<string | null>(null)
 
   const [updateCheckBusy, setUpdateCheckBusy] = useState(false)
@@ -164,15 +474,6 @@ export function SettingsPage() {
   useEffect(() => {
     if (settings) {
       const s = settings as Record<string, string>
-      setProvider(s.ai_provider || 'moonshot')
-      setModel(s.ai_model || '')
-      setApiKey(s.ai_api_key || '')
-      setOllamaEndpoint(s.ollama_endpoint || 'http://localhost:11434')
-      setMoonshotApiBase(s.moonshot_api_base || '')
-      setMoonshotApiKey(s.moonshot_api_key || '')
-      setKimiCliPath(s.kimi_cli_path || '')
-      setKimiCliMaxSteps(s.kimi_cli_max_steps || '48')
-      setDetectionApiKey(s.openai_detection_api_key || '')
       setCloudSyncPath(s.cloud_sync_path || '')
       setCloudSyncEnabled(s.cloud_sync_enabled === '1' || s.cloud_sync_enabled === 'true')
     }
@@ -190,6 +491,7 @@ export function SettingsPage() {
         const scorer = active.find((p) => p.type === 'scorer')
         const rh = await api.getSetting(APP_SETTING_RISICO_PROMPT_HOOFD)
         const re = await api.getSetting(APP_SETTING_RISICO_PROMPT_EXTRACTIE)
+        const df = await api.getSetting(APP_SETTING_DOC_FILL_PROMPT)
         if (cancelled) return
         setPromptAgentId(agent?.id ?? null)
         setPromptScorerId(scorer?.id ?? null)
@@ -197,6 +499,16 @@ export function SettingsPage() {
         setPromptScorerText(scorer?.prompt_tekst ?? '')
         setRisicoHoofdText(typeof rh === 'string' ? rh : '')
         setRisicoExtractieText(typeof re === 'string' ? re : '')
+        // Als er niets is opgeslagen laten we de gebruiker de ingebouwde
+        // default zien (importeren kan alleen zo in de renderer).
+        const { DEFAULT_DOCUMENT_FILL_PROMPT_TEXT } = await import(
+          '@shared/document-fill-prompt-default'
+        )
+        setDocFillPromptText(
+          typeof df === 'string' && df.trim().length > 40
+            ? df
+            : DEFAULT_DOCUMENT_FILL_PROMPT_TEXT,
+        )
         promptsLoadedOnce.current = true
       } catch (e) {
         if (!cancelled) {
@@ -223,6 +535,7 @@ export function SettingsPage() {
       }
       await api.setSetting(APP_SETTING_RISICO_PROMPT_HOOFD, risicoHoofdText)
       await api.setSetting(APP_SETTING_RISICO_PROMPT_EXTRACTIE, risicoExtractieText)
+      await api.setSetting(APP_SETTING_DOC_FILL_PROMPT, docFillPromptText)
       setPromptsSaved(true)
       setTimeout(() => setPromptsSaved(false), 2500)
     } catch (e) {
@@ -273,21 +586,6 @@ export function SettingsPage() {
       cancelled = true
     }
   }, [cloudSyncPath])
-
-  const handleSaveAI = async () => {
-    await api.setSetting('ai_provider', provider)
-    await api.setSetting('ai_model', model)
-    await api.setSetting('ai_api_key', apiKey)
-    await api.setSetting('ollama_endpoint', ollamaEndpoint)
-    await api.setSetting('moonshot_api_base', moonshotApiBase)
-    await api.setSetting('moonshot_api_key', moonshotApiKey)
-    await api.setSetting('kimi_cli_path', kimiCliPath)
-    await api.setSetting('kimi_cli_max_steps', kimiCliMaxSteps)
-    await api.setSetting('openai_detection_api_key', detectionApiKey)
-    setSaved(true)
-    setTimeout(() => setSaved(false), 2000)
-    refreshSettings()
-  }
 
   const handleSaveCloudSync = async () => {
     await api.setSetting('cloud_sync_path', cloudSyncPath.trim())
@@ -383,6 +681,10 @@ export function SettingsPage() {
     setModalPattern('weekdays')
     setModalWeekDay(1)
     setModalIntervalHours(6)
+    const active = ((bronWebsites as { id: string; is_actief?: number }[]) || []).filter(
+      (b) => b.is_actief !== 0,
+    )
+    setModalScheduleBronIds(active.map((b) => b.id))
     setScheduleModalOpen(true)
   }
 
@@ -398,14 +700,22 @@ export function SettingsPage() {
       setScheduleModalError('Ongeldige tijd of interval. Controleer de invoer.')
       return
     }
+    if (modalScheduleBronIds.length === 0) {
+      setScheduleModalError('Selecteer minstens één bron die bij deze geplande run gescraped moet worden.')
+      return
+    }
     setScheduleModalError(null)
-    await api.createSchedule({
-      naam: modalScheduleName.trim(),
-      cron_expressie: cron,
-      bron_website_ids: [],
-    })
-    setScheduleModalOpen(false)
-    refreshSchedules()
+    try {
+      await api.createSchedule({
+        naam: modalScheduleName.trim(),
+        cron_expressie: cron,
+        bron_website_ids: modalScheduleBronIds,
+      })
+      setScheduleModalOpen(false)
+      refreshSchedules()
+    } catch (e) {
+      setScheduleModalError(e instanceof Error ? e.message : 'Schema opslaan mislukt.')
+    }
   }
 
   const handleToggleSchedule = async (id: string) => {
@@ -416,6 +726,60 @@ export function SettingsPage() {
   const handleDeleteSchedule = async (id: string) => {
     await api.deleteSchedule(id)
     refreshSchedules()
+  }
+
+  const handleProcessUrl = async () => {
+    if (!isElectron || !(api as any).processUrl) return
+    const url = processUrl.trim()
+    if (!url) {
+      setProcessUrlResult({ tone: 'warn', text: 'Voer eerst een URL in.' })
+      return
+    }
+    setProcessUrlBusy(true)
+    setProcessUrlResult(null)
+    setProcessUrlStep('Verbinding maken…')
+    setProcessUrlPct(0)
+
+    try {
+      // De handler retourneert meteen nadat het DB-record is aangemaakt.
+      // Het zware werk (document-discovery + analyse) loopt door in de achtergrond
+      // en stuurt voortgang via onProcessUrlProgress (zie useEffect hierboven).
+      const r = (await (api as any).processUrl(url)) as {
+        started?: boolean
+        success?: boolean
+        error?: string
+        alreadyExists?: boolean
+        tenderId?: string
+        tenderTitel?: string
+      }
+
+      if (r.alreadyExists) {
+        setProcessUrlResult({
+          tone: 'info',
+          text: `Deze aanbesteding bestaat al: "${r.tenderTitel}"`,
+          tenderId: r.tenderId,
+          tenderTitel: r.tenderTitel,
+        })
+        setProcessUrlBusy(false)
+        setProcessUrlStep('')
+        setProcessUrlPct(0)
+      } else if (r.started) {
+        // Aangemaakt — voortgang loopt via achtergrondtaak (done: true event sluit de balk)
+        setProcessUrl('')
+        setProcessUrlStep('Documenten ophalen op de achtergrond…')
+        setProcessUrlPct(5)
+      } else if (r.success === false) {
+        setProcessUrlResult({ tone: 'warn', text: r.error || 'Verwerking mislukt.' })
+        setProcessUrlBusy(false)
+        setProcessUrlStep('')
+        setProcessUrlPct(0)
+      }
+    } catch (e) {
+      setProcessUrlResult({ tone: 'warn', text: e instanceof Error ? e.message : 'Verwerking mislukt.' })
+      setProcessUrlBusy(false)
+      setProcessUrlStep('')
+      setProcessUrlPct(0)
+    }
   }
 
   const handleCheckUpdates = async () => {
@@ -434,7 +798,7 @@ export function SettingsPage() {
         return
       }
       if (r.isUpdateAvailable) {
-        // UpdateNotifier-modal verschijnt automatisch via IPC-event — geen extra melding nodig
+        // Toast rechtsonder (UpdateNotifier) via IPC na check — geen extra melding nodig
       } else {
         setUpdateCheckNote({
           tone: 'neutral',
@@ -451,12 +815,13 @@ export function SettingsPage() {
     }
   }
 
-  const modelOptions: Record<string, string[]> = {
-    claude: ['claude-sonnet-4-6', 'claude-haiku-4-5-20251001', 'claude-opus-4-6'],
-    openai: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo'],
-    moonshot: ['kimi-k2.6', 'kimi-k2.5', 'kimi-k2', 'moonshot-v1-128k', 'moonshot-v1-32k', 'moonshot-v1-8k'],
-    kimi_cli: ['kimi-k2.6', 'kimi-k2.5', 'kimi-k2', 'moonshot-v1-128k', 'moonshot-v1-32k', 'moonshot-v1-8k'],
-    ollama: ['gemma4', 'llama3.1', 'llama3.2', 'mistral', 'codellama', 'gemma2'],
+  if (!pinUnlocked) {
+    return (
+      <SettingsPinModal
+        onUnlocked={() => setPinUnlocked(true)}
+        onCancel={() => navigate(-1)}
+      />
+    )
   }
 
   return (
@@ -496,6 +861,21 @@ export function SettingsPage() {
         >
           <Building2 className="h-4 w-4" />
           Bedrijfsprofielen
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            setMainTab('versiebeheer')
+            setReleaseAdminUnlocked(isReleaseAdminPinUnlocked())
+          }}
+          className={`inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors ${
+            mainTab === 'versiebeheer'
+              ? 'bg-[var(--primary)] text-[var(--primary-foreground)]'
+              : 'bg-[var(--muted)]/50 text-[var(--foreground)] hover:bg-[var(--muted)]'
+          }`}
+        >
+          <Rocket className="h-4 w-4" />
+          Versiebeheer
         </button>
       </div>
 
@@ -568,6 +948,42 @@ export function SettingsPage() {
                     className="mt-2 w-full rounded-lg border bg-[var(--background)] px-3 py-2 font-mono text-xs leading-relaxed focus:outline-none focus:ring-2 focus:ring-[var(--ring)]"
                   />
                 </div>
+                {FEATURE_DOCUMENT_FORM_FILL ? (
+                  <div>
+                    <div className="flex items-center justify-between">
+                      <label className="text-sm font-medium">
+                        Documenten invullen — veldextractie &amp; checklist (pre-analyse)
+                      </label>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void (async () => {
+                            const { DEFAULT_DOCUMENT_FILL_PROMPT_TEXT } = await import(
+                              '@shared/document-fill-prompt-default'
+                            )
+                            setDocFillPromptText(DEFAULT_DOCUMENT_FILL_PROMPT_TEXT)
+                          })()
+                        }}
+                        className="text-xs text-[var(--muted-foreground)] underline hover:no-underline"
+                        title="Herstel standaardprompt"
+                      >
+                        Herstel standaard
+                      </button>
+                    </div>
+                    <p className="mt-1 text-xs text-[var(--muted-foreground)]">
+                      Bestuurt zowel de inventarisatie van invulvelden als de checklist met
+                      “te verzamelen informatie” per document. Harde regels: geen verzinsels,
+                      citaten uitsluitend als letterlijke substring van de documenttekst.
+                      Wijzigingen gelden voor de volgende pre-analyses.
+                    </p>
+                    <textarea
+                      value={docFillPromptText}
+                      onChange={(e) => setDocFillPromptText(e.target.value)}
+                      rows={18}
+                      className="mt-2 w-full rounded-lg border bg-[var(--background)] px-3 py-2 font-mono text-xs leading-relaxed focus:outline-none focus:ring-2 focus:ring-[var(--ring)]"
+                    />
+                  </div>
+                ) : null}
                 <button
                   type="button"
                   onClick={() => void handleSavePrompts()}
@@ -593,205 +1009,22 @@ export function SettingsPage() {
         <BedrijfsprofielTab />
       ) : null}
 
+      {mainTab === 'versiebeheer' ? (
+        <>
+          {isElectron && !releaseAdminUnlocked ? (
+            <SettingsPinModal
+              variant="release"
+              onUnlocked={() => setReleaseAdminUnlocked(true)}
+              onCancel={() => setMainTab('algemeen')}
+            />
+          ) : (
+            <ReleaseAdminSection />
+          )}
+        </>
+      ) : null}
+
       {mainTab === 'algemeen' ? (
         <>
-      {/* AI Model Configuration */}
-      <div className="rounded-xl border bg-[var(--card)] p-6 shadow-sm">
-        <h3 className="text-base font-semibold flex items-center gap-2 mb-4">
-          <Brain className="h-5 w-5 text-[var(--primary)]" /> AI Model configuratie
-        </h3>
-
-        <div className="space-y-4">
-          <div>
-            <label className="text-sm font-medium">Provider</label>
-            <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-3">
-              {[
-                { id: 'claude', label: 'Claude (Anthropic)', icon: '🤖' },
-                { id: 'openai', label: 'OpenAI', icon: '🧠' },
-                { id: 'moonshot', label: 'Kimi (Moonshot API)', icon: '🌙' },
-                { id: 'kimi_cli', label: 'Kimi Code CLI', icon: '⌨️' },
-                { id: 'ollama', label: 'Ollama (lokaal)', icon: '💻' },
-              ].map(p => (
-                <button
-                  key={p.id}
-                  onClick={() => { setProvider(p.id); setModel(modelOptions[p.id]?.[0] || '') }}
-                  className={`rounded-lg border p-3 text-left transition-colors ${
-                    provider === p.id ? 'border-[var(--primary)] bg-[var(--primary)]/5' : 'hover:bg-[var(--muted)]/50'
-                  }`}
-                >
-                  <p className="text-lg">{p.icon}</p>
-                  <p className="mt-1 text-xs font-medium">{p.label}</p>
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div>
-            <label className="text-sm font-medium">Model</label>
-            <select
-              value={model}
-              onChange={e => setModel(e.target.value)}
-              className="mt-1 w-full rounded-lg border bg-[var(--background)] px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[var(--ring)]"
-            >
-              {(modelOptions[provider] || []).map(m => (
-                <option key={m} value={m}>{m}</option>
-              ))}
-            </select>
-          </div>
-
-          {provider !== 'ollama' ? (
-            <div className="space-y-3">
-              <div>
-                <label className="text-sm font-medium flex items-center gap-1.5">
-                  <Key className="h-4 w-4" /> API Sleutel
-                </label>
-                <input
-                  type="password"
-                  value={apiKey}
-                  onChange={e => setApiKey(e.target.value)}
-                  placeholder={
-                    provider === 'claude'
-                      ? 'sk-ant-...'
-                      : provider === 'moonshot' || provider === 'kimi_cli'
-                        ? 'Moonshot API key (KIMI_API_KEY voor CLI)'
-                        : 'sk-...'
-                  }
-                  className="mt-1 w-full rounded-lg border bg-[var(--background)] px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[var(--ring)]"
-                />
-              </div>
-              {(provider === 'moonshot' || provider === 'kimi_cli') && (
-                <div>
-                  <label className="text-sm font-medium flex items-center gap-1.5">
-                    <Server className="h-4 w-4" /> API-basis-URL (optioneel)
-                  </label>
-                  <input
-                    value={moonshotApiBase}
-                    onChange={e => setMoonshotApiBase(e.target.value)}
-                    placeholder="https://api.moonshot.cn/v1"
-                    className="mt-1 w-full rounded-lg border bg-[var(--background)] px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[var(--ring)]"
-                  />
-                  <p className="mt-1 text-[11px] text-[var(--muted-foreground)]">
-                    Leeg laten voor standaard Moonshot-endpoint (wordt doorgegeven als KIMI_BASE_URL bij Kimi CLI).
-                  </p>
-                </div>
-              )}
-              {provider === 'kimi_cli' && (
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <div className="sm:col-span-2">
-                    <label className="text-sm font-medium flex items-center gap-1.5">
-                      <Server className="h-4 w-4" /> Pad naar <code className="text-xs">kimi</code> (optioneel)
-                    </label>
-                    <input
-                      value={kimiCliPath}
-                      onChange={e => setKimiCliPath(e.target.value)}
-                      placeholder="kimi (standaard op PATH)"
-                      className="mt-1 w-full rounded-lg border bg-[var(--background)] px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[var(--ring)]"
-                    />
-                    <p className="mt-1 text-[11px] text-[var(--muted-foreground)]">
-                      Bijv. uit <code className="text-[10px]">uv tool install --python 3.13 kimi-cli</code>. Laat leeg als <code className="text-[10px]">kimi</code> op PATH staat.
-                    </p>
-                  </div>
-                  <div>
-                    <label className="text-sm font-medium">Max. stappen per beurt (CLI)</label>
-                    <input
-                      type="number"
-                      min={1}
-                      max={200}
-                      value={kimiCliMaxSteps}
-                      onChange={e => setKimiCliMaxSteps(e.target.value)}
-                      className="mt-1 w-full rounded-lg border bg-[var(--background)] px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[var(--ring)]"
-                    />
-                    <p className="mt-1 text-[11px] text-[var(--muted-foreground)]">
-                      Komt overeen met <code className="text-[10px]">--max-steps-per-turn</code> (1–200).
-                    </p>
-                  </div>
-                </div>
-              )}
-            </div>
-          ) : (
-            <div>
-              <label className="text-sm font-medium flex items-center gap-1.5">
-                <Server className="h-4 w-4" /> Ollama Endpoint
-              </label>
-              <input
-                value={ollamaEndpoint}
-                onChange={e => setOllamaEndpoint(e.target.value)}
-                className="mt-1 w-full rounded-lg border bg-[var(--background)] px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[var(--ring)]"
-              />
-              <p className="mt-1 text-[11px] text-[var(--muted-foreground)]">
-                Lokaal (bijv. Gemma via Ollama) blijft beschikbaar; voor betrouwbare tender-analyse met lange context wordt een cloud-model aanbevolen.
-              </p>
-            </div>
-          )}
-
-          {/* OpenAI Detection key — always shown, needed for Mercell document detection */}
-          <div className="rounded-lg border border-amber-200 dark:border-amber-700/50 bg-amber-50 dark:bg-amber-950/25 p-4 space-y-2">
-            <label className="text-sm font-medium flex items-center gap-1.5">
-              <AlertCircle className="h-4 w-4 text-amber-600 dark:text-amber-400" />
-              OpenAI sleutel voor documentdetectie
-            </label>
-            <p className="text-xs text-[var(--muted-foreground)]">
-              Wordt gebruikt om te detecteren of aanbestedingsdocumenten op Mercell staan (in plaats van TenderNed).
-              Altijd vereist, ook als je Claude of Ollama gebruikt voor de analyse.
-              Zonder deze sleutel werkt alleen regex-detectie.
-            </p>
-            <input
-              type="password"
-              value={detectionApiKey}
-              onChange={e => setDetectionApiKey(e.target.value)}
-              placeholder="sk-..."
-              className="w-full rounded-lg border bg-white dark:bg-[var(--input)] px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[var(--ring)]"
-            />
-            {detectionApiKey ? (
-              <p className="flex items-center gap-1 text-xs text-green-600 dark:text-green-400">
-                <CheckCircle2 className="h-3.5 w-3.5" /> Sleutel ingesteld — Mercell-detectie actief
-              </p>
-            ) : (
-              <p className="flex items-center gap-1 text-xs text-amber-600 dark:text-amber-400">
-                <AlertCircle className="h-3.5 w-3.5" /> Geen sleutel — alleen regex-detectie (minder betrouwbaar)
-              </p>
-            )}
-          </div>
-
-          {/* Kimi / Moonshot sleutel — specifiek voor risico-inventarisatie */}
-          <div className="rounded-lg border border-purple-200 dark:border-purple-700/50 bg-purple-50 dark:bg-purple-950/25 p-4 space-y-2">
-            <label className="text-sm font-medium flex items-center gap-1.5">
-              <Brain className="h-4 w-4 text-purple-600 dark:text-purple-400" />
-              Kimi (Moonshot) sleutel voor risico-inventarisatie
-            </label>
-            <p className="text-xs text-[var(--muted-foreground)]">
-              Risico-inventarisatie wordt altijd uitgevoerd met <strong>Kimi k2.6</strong> (goedkoop, 128k context).
-              Als je een andere hoofd-AI gebruikt (bijv. OpenAI of Claude), vul hier je Moonshot API-sleutel in.
-              Leeg laten: de hoofd-AI-sleutel wordt gebruikt — dit kan context-fouten geven bij grote dossiers.
-            </p>
-            <input
-              type="password"
-              value={moonshotApiKey}
-              onChange={e => setMoonshotApiKey(e.target.value)}
-              placeholder="sk-... (Moonshot API key)"
-              className="w-full rounded-lg border bg-white dark:bg-[var(--input)] px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[var(--ring)]"
-            />
-            {moonshotApiKey ? (
-              <p className="flex items-center gap-1 text-xs text-purple-600 dark:text-purple-400">
-                <CheckCircle2 className="h-3.5 w-3.5" /> Kimi k2.6 actief voor risico-inventarisatie
-              </p>
-            ) : (
-              <p className="flex items-center gap-1 text-xs text-amber-600 dark:text-amber-400">
-                <AlertCircle className="h-3.5 w-3.5" /> Geen sleutel — hoofd-AI wordt gebruikt (kans op context-overflow bij grote dossiers)
-              </p>
-            )}
-          </div>
-
-          <button
-            onClick={handleSaveAI}
-            className="flex items-center gap-1.5 rounded-lg bg-[var(--primary)] px-4 py-2.5 text-sm font-medium text-[var(--primary-foreground)] hover:opacity-90 transition-opacity"
-          >
-            {saved ? <CheckCircle2 className="h-4 w-4" /> : <Save className="h-4 w-4" />}
-            {saved ? 'Opgeslagen!' : 'Opslaan'}
-          </button>
-        </div>
-      </div>
-
       {isElectron ? (
         <div className="rounded-xl border bg-[var(--card)] p-6 shadow-sm">
           <h3 className="text-base font-semibold flex items-center gap-2 mb-2">
@@ -867,6 +1100,151 @@ export function SettingsPage() {
                 {cloudSyncBusy ? 'Bezig…' : 'Nu synchroniseren'}
               </button>
             </div>
+          </div>
+        </div>
+      ) : null}
+
+      {/* ── Supabase Cloud Sync ────────────────────────────────────────────── */}
+      {isElectron ? (
+        <div className="rounded-xl border bg-[var(--card)] p-6 shadow-sm space-y-4">
+          <div>
+            <h3 className="text-base font-semibold flex items-center gap-2 mb-1">
+              <RefreshCw className="h-5 w-5 text-[var(--primary)]" /> Cloud-synchronisatie
+            </h3>
+            <p className="text-xs text-[var(--muted-foreground)] leading-relaxed max-w-2xl">
+              Alle tendertabellen (aanbestedingen, scrapes, criteria, agent, enz.) worden met Supabase gesynchroniseerd.
+              <strong> Alles uploaden</strong> stuurt in één keer je volledige lokale DB + bijlagen; <strong>Alles ophalen</strong>{' '}
+              vult vanuit de cloud (nieuwe pc). Daarnaast: achtergrond-sync elke <strong>2 minuten</strong> en korte wachttijd na
+              wijzigingen of na een scrape, zodat nieuwe data automatisch richting Supabase gaat solange de app open is.
+            </p>
+          </div>
+
+          <div className="rounded-lg border border-[var(--border)] bg-[var(--background)] p-4 space-y-3 max-w-2xl">
+            <p className="text-sm font-medium">Supabase-verbinding</p>
+            <p className="text-xs text-[var(--muted-foreground)]">
+              Nodig voor sync en upload (ook bij een DMG zonder meegeëmbedde .env). Vul de project-URL en de{' '}
+              <span className="whitespace-nowrap">anon (public) key</span> uit je Supabase-dashboard. Daarna opslaan en{' '}
+              <strong>Test verbinding</strong>. Zonder extra SQL-policies voor rol <code className="text-[10px]">anon</code> blijft
+              uploaden/lezen geblokkeerd: voer het migratiebestand <code className="text-[10px]">20260429120000_rls_anon_policies_idempotent.sql</code>{' '}
+              uit in de Supabase SQL Editor (map <code className="text-[10px]">supabase/migrations</code>).
+            </p>
+            <div>
+              <label className="text-xs font-medium text-[var(--muted-foreground)]">Project-URL</label>
+              <input
+                type="url"
+                value={supabaseFormUrl}
+                onChange={(e) => setSupabaseFormUrl(e.target.value)}
+                placeholder="https://…supabase.co"
+                className="mt-1 w-full rounded-lg border bg-[var(--background)] px-3 py-2 text-sm"
+                autoComplete="off"
+              />
+            </div>
+            <div>
+              <label className="text-xs font-medium text-[var(--muted-foreground)]">Anon (public) key</label>
+              <input
+                type="password"
+                value={supabaseFormKey}
+                onChange={(e) => setSupabaseFormKey(e.target.value)}
+                placeholder="eyJ…"
+                className="mt-1 w-full rounded-lg border bg-[var(--background)] px-3 py-2 text-sm font-mono"
+                autoComplete="off"
+              />
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void handleSaveSupabaseConnection()}
+                disabled={supabaseFormSaving}
+                className="inline-flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--card)] px-3 py-2 text-sm font-medium hover:bg-[var(--muted)]/30 disabled:opacity-50"
+              >
+                {supabaseFormSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                {supabaseFormSaved ? 'Opgeslagen' : 'Supabase-gegevens opslaan'}
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleSbTestConnection()}
+                disabled={supabaseFormSaving || sbConnTestBusy}
+                className="inline-flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2 text-sm font-medium hover:bg-[var(--muted)]/30 disabled:opacity-50"
+              >
+                {sbConnTestBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Cloud className="h-4 w-4" />}
+                {sbConnTestBusy ? 'Testen…' : 'Test verbinding'}
+              </button>
+            </div>
+          </div>
+
+          {sbSyncStatus?.lastError ? (
+            <p className="text-sm text-amber-700 dark:text-amber-400 leading-relaxed max-w-2xl">
+              <span className="font-medium">Laatste sync-fout: </span>
+              {sbSyncStatus.lastError}
+            </p>
+          ) : null}
+
+          {sbSyncStatus ? (
+            <div className="grid grid-cols-2 gap-3 text-xs text-[var(--muted-foreground)]">
+              <div className="rounded-lg border bg-[var(--background)] px-3 py-2">
+                <p className="font-medium text-[var(--foreground)] mb-0.5">Laatste upload</p>
+                <p>{sbSyncStatus.lastPushAt ? new Date(sbSyncStatus.lastPushAt).toLocaleString('nl-NL') : '—'}</p>
+              </div>
+              <div className="rounded-lg border bg-[var(--background)] px-3 py-2">
+                <p className="font-medium text-[var(--foreground)] mb-0.5">Laatste download</p>
+                <p>{sbSyncStatus.lastPullAt ? new Date(sbSyncStatus.lastPullAt).toLocaleString('nl-NL') : '—'}</p>
+              </div>
+            </div>
+          ) : null}
+
+          {sbSyncNote ? (
+            <p className={`text-sm leading-relaxed ${sbSyncNote.tone === 'warn' ? 'text-amber-700 dark:text-amber-400' : 'text-green-700 dark:text-green-400'}`}>
+              {sbSyncNote.text}
+            </p>
+          ) : null}
+
+          {sbFullPushProgress != null && (
+            <div className="max-w-2xl space-y-1.5" aria-live="polite" aria-label="Supabase upload voortgang">
+              <p className="text-xs text-[var(--muted-foreground)] leading-snug truncate" title={sbFullPushProgress.label}>
+                {sbFullPushProgress.label}
+              </p>
+              <div className="h-2.5 w-full overflow-hidden rounded-full bg-[var(--muted)]/50">
+                <div
+                  className="h-full rounded-full bg-[var(--primary)] transition-[width] duration-200 ease-out"
+                  style={{ width: `${Math.min(100, Math.max(0, sbFullPushProgress.percent))}%` }}
+                />
+              </div>
+              <p className="text-right text-[10px] tabular-nums text-[var(--muted-foreground)]">
+                {Math.round(Math.min(100, Math.max(0, sbFullPushProgress.percent)))}%
+              </p>
+            </div>
+          )}
+
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => void handleSbSyncNow()}
+              disabled={sbSyncBusy}
+              className="inline-flex items-center gap-2 rounded-lg bg-[var(--primary)] px-4 py-2.5 text-sm font-medium text-[var(--primary-foreground)] hover:opacity-90 disabled:opacity-50"
+            >
+              {sbSyncBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+              {sbSyncBusy ? 'Bezig…' : 'Sync nu'}
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleSbFullPush()}
+              disabled={sbSyncBusy}
+              className="inline-flex items-center gap-2 rounded-lg border border-[var(--primary)]/30 px-4 py-2.5 text-sm font-medium hover:bg-[var(--muted)]/40 disabled:opacity-50"
+              title="Kopieer alle lokale tabelrijen + bijlagen naar Supabase; originele bestanden op deze pc blijven bewaard"
+            >
+              {sbSyncBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <CloudUpload className="h-4 w-4" />}
+              Alles uploaden
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleSbFullPull()}
+              disabled={sbSyncBusy}
+              className="inline-flex items-center gap-2 rounded-lg border px-4 py-2.5 text-sm font-medium hover:bg-[var(--muted)]/40 disabled:opacity-50"
+              title="Haal alle gegevens op uit de cloud — gebruik dit op een nieuwe pc om alles in één keer te importeren"
+            >
+              {sbSyncBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+              Alles ophalen (nieuwe pc)
+            </button>
           </div>
         </div>
       ) : null}
@@ -964,8 +1342,13 @@ export function SettingsPage() {
           <Clock className="h-5 w-5 text-[var(--primary)]" /> Geplande tracking
         </h3>
         <p className="text-xs text-[var(--muted-foreground)] mb-4 leading-relaxed">
-          Geplande tracking draait op de lokale tijd van je computer (node-cron). Na een geplande run worden nieuwe
-          aanbestedingen automatisch volledig geanalyseerd, inclusief risico-inventarisatie.
+          Geplande tracking gebruikt de tijdzone van je systeem en draait alleen als TenderTracker open is (actief of op
+          de achtergrond). Als de Mac op het geplande tijdstip in slaapstand staat, slaat macOS die run over tot het
+          volgende tijdstip. Bij het aanmaken van een schema kies je met vinkjes welke bronnen worden gescraped;
+          standaard staan alle actieve bronnen aan. Voeg je later een bron toe, vink die dan aan in een nieuw schema of
+          vervang het oude. Oudere schema’s zonder bronkeuze volgen nog “alle actieve bronnen”. Handmatig in- of
+          uitloggen bepaalt mee welke sessies bruikbaar zijn op het moment van de run. Na een run kunnen nieuwe
+          aanbestedingen automatisch worden geanalyseerd (instelling op de Tracking-pagina).
         </p>
         <button
           type="button"
@@ -984,6 +1367,9 @@ export function SettingsPage() {
                   title={`Cron (technisch): ${s.cron_expressie}`}
                 >
                   {describeCron(s.cron_expressie)}
+                </p>
+                <p className="text-[10px] text-[var(--muted-foreground)] mt-0.5">
+                  {describeScheduleBronnen(s.bron_website_ids, (bronWebsites as { id: string; naam: string }[]) || [])}
                 </p>
               </div>
               <label className="relative inline-flex cursor-pointer items-center">
@@ -1007,7 +1393,7 @@ export function SettingsPage() {
             aria-modal="true"
             aria-labelledby="schedule-modal-title"
           >
-            <div className="w-full max-w-md rounded-xl border bg-[var(--card)] p-5 shadow-lg">
+            <div className="w-full max-w-lg rounded-xl border bg-[var(--card)] p-5 shadow-lg max-h-[90vh] overflow-y-auto">
               <div className="flex items-start justify-between gap-2 mb-4">
                 <h4 id="schedule-modal-title" className="text-base font-semibold">
                   Geplande tracking
@@ -1095,6 +1481,57 @@ export function SettingsPage() {
                     />
                   </div>
                 )}
+                <div>
+                  <div className="flex items-center justify-between gap-2">
+                    <label className="text-xs text-[var(--muted-foreground)]">Bronnen voor deze run</label>
+                    <button
+                      type="button"
+                      className="text-xs font-medium text-[var(--primary)] hover:underline"
+                      onClick={() => {
+                        const active = ((bronWebsites as { id: string; is_actief?: number }[]) || []).filter(
+                          (b) => b.is_actief !== 0,
+                        )
+                        setModalScheduleBronIds(active.map((b) => b.id))
+                      }}
+                    >
+                      Alles selecteren
+                    </button>
+                  </div>
+                  <div className="mt-2 max-h-44 space-y-1 overflow-y-auto rounded-lg border bg-[var(--background)] p-2">
+                    {((bronWebsites as { id: string; naam: string; is_actief?: number }[]) || []).filter(
+                      (b) => b.is_actief !== 0,
+                    ).length === 0 ? (
+                      <p className="text-xs text-[var(--muted-foreground)] px-1 py-2">
+                        Geen actieve bronnen. Voeg bronnen toe onder het menu Bronnen.
+                      </p>
+                    ) : (
+                      ((bronWebsites as { id: string; naam: string; is_actief?: number }[]) || [])
+                        .filter((b) => b.is_actief !== 0)
+                        .map((b) => (
+                          <label
+                            key={b.id}
+                            className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-sm hover:bg-[var(--muted)]/50"
+                          >
+                            <input
+                              type="checkbox"
+                              className="rounded"
+                              checked={modalScheduleBronIds.includes(b.id)}
+                              onChange={() => {
+                                setModalScheduleBronIds((prev) =>
+                                  prev.includes(b.id) ? prev.filter((x) => x !== b.id) : [...prev, b.id],
+                                )
+                              }}
+                            />
+                            <span>{b.naam}</span>
+                          </label>
+                        ))
+                    )}
+                  </div>
+                  <p className="mt-1.5 text-[10px] text-[var(--muted-foreground)] leading-relaxed">
+                    Een bron die je later toevoegt, staat niet automatisch in bestaande schema’s: voeg een nieuw schema toe
+                    en vink die bron aan, of wis het oude schema en maak opnieuw aan.
+                  </p>
+                </div>
               </div>
               <div className="mt-5 flex justify-end gap-2">
                 <button
@@ -1116,6 +1553,99 @@ export function SettingsPage() {
                 </button>
               </div>
             </div>
+          </div>
+        )}
+      </div>
+
+      {/* ── Handmatige URL-verwerking ── */}
+      <div className="rounded-xl border bg-[var(--card)] p-6 shadow-sm">
+        <h3 className="text-base font-semibold flex items-center gap-2 mb-2">
+          <Link2 className="h-5 w-5 text-[var(--primary)]" />
+          Aanbesteding verwerken via URL
+        </h3>
+        <p className="text-xs text-[var(--muted-foreground)] mb-4 leading-relaxed">
+          Voer de URL van een aanbestedingspagina in (bijv. TenderNed, Mercell, gemeentesite).
+          De app controleert of de aanbesteding al bestaat, haalt daarna de documenten op,
+          en start automatisch de AI-analyse en risico-inventarisatie.
+        </p>
+
+        {!isElectron && (
+          <p className="text-sm text-[var(--muted-foreground)]">Alleen beschikbaar in de desktop-app.</p>
+        )}
+
+        {isElectron && (
+          <div className="space-y-3">
+            <div className="flex gap-2">
+              <input
+                type="url"
+                value={processUrl}
+                onChange={(e) => { setProcessUrl(e.target.value); setProcessUrlResult(null) }}
+                onKeyDown={(e) => { if (e.key === 'Enter' && !processUrlBusy) void handleProcessUrl() }}
+                placeholder="https://www.tenderned.nl/aankondigingen/..."
+                disabled={processUrlBusy}
+                className="flex-1 rounded-lg border bg-[var(--background)] px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[var(--ring)] disabled:opacity-50 font-mono"
+              />
+              <button
+                type="button"
+                onClick={() => void handleProcessUrl()}
+                disabled={processUrlBusy || !processUrl.trim()}
+                className="inline-flex items-center gap-2 rounded-lg bg-[var(--primary)] px-4 py-2 text-sm font-semibold text-[var(--primary-foreground)] hover:opacity-90 disabled:opacity-50 whitespace-nowrap"
+              >
+                {processUrlBusy ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Play className="h-4 w-4" />
+                )}
+                Nu verwerken
+              </button>
+            </div>
+
+            {/* Voortgangsbalk */}
+            {processUrlBusy && (
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between text-xs text-[var(--muted-foreground)]">
+                  <span className="truncate">{processUrlStep || 'Bezig…'}</span>
+                  <span className="ml-2 tabular-nums">{processUrlPct}%</span>
+                </div>
+                <div className="h-1.5 w-full rounded-full bg-[var(--muted)]">
+                  <div
+                    className="h-1.5 rounded-full bg-[var(--primary)] transition-all duration-300"
+                    style={{ width: `${processUrlPct}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {/* Resultaatmelding */}
+            {processUrlResult && (
+              <div className={`flex items-start gap-3 rounded-lg border px-4 py-3 text-sm ${
+                processUrlResult.tone === 'ok'
+                  ? 'border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-700/50 dark:bg-emerald-950/30 dark:text-emerald-300'
+                  : processUrlResult.tone === 'info'
+                    ? 'border-blue-200 bg-blue-50 text-blue-800 dark:border-blue-700/50 dark:bg-blue-950/30 dark:text-blue-300'
+                    : 'border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-700/50 dark:bg-amber-950/30 dark:text-amber-300'
+              }`}>
+                {processUrlResult.tone === 'ok' ? (
+                  <CheckCircle2 className="h-4 w-4 mt-0.5 shrink-0" />
+                ) : processUrlResult.tone === 'info' ? (
+                  <AlertCircle className="h-4 w-4 mt-0.5 shrink-0 text-blue-600 dark:text-blue-400" />
+                ) : (
+                  <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
+                )}
+                <div className="flex-1 min-w-0">
+                  <p>{processUrlResult.text}</p>
+                  {processUrlResult.tenderId && (
+                    <Link
+                      to={`/aanbestedingen/${processUrlResult.tenderId}`}
+                      className="mt-1.5 inline-flex items-center gap-1 text-xs font-medium underline underline-offset-2 hover:opacity-80"
+                    >
+                      <ExternalLink className="h-3 w-3" />
+                      Bekijk aanbesteding
+                    </Link>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>

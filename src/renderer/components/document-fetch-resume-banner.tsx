@@ -27,14 +27,14 @@ export function DocumentFetchResumeBanner() {
   }
 
   return (
-    <div className="titlebar-no-drag border-b border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-950 dark:border-amber-900/50 dark:bg-amber-950/40 dark:text-amber-100">
+    <div className="titlebar-no-drag border-b border-amber-200 bg-amber-50 px-4 py-2 text-sm dark:border-amber-900/50 dark:bg-amber-950/40">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-2">
-          <FolderSync className="h-4 w-4 shrink-0 text-amber-700 dark:text-amber-300" aria-hidden />
-          <span className="min-w-0 truncate">
+        <div className="doc-resume-banner-copy flex min-w-0 items-center gap-2">
+          <FolderSync className="h-4 w-4 shrink-0 text-zinc-800 dark:text-amber-300" aria-hidden />
+          <p className="min-w-0 truncate text-sm m-0">
             <span className="font-medium">Documentophalen op de achtergrond:</span>{' '}
-            <span className="text-amber-900/90 dark:text-amber-200/90">{p.message}</span>
-          </span>
+            <span className="font-normal">{p.message}</span>
+          </p>
         </div>
         <div className="flex flex-wrap items-center gap-2 shrink-0">
           {stopErr && <span className="text-xs text-red-700 dark:text-red-300">{stopErr}</span>}

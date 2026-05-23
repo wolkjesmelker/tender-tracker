@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useSources } from '../hooks/use-ipc'
 import { api } from '../lib/ipc-client'
 import { formatDateTime } from '../lib/utils'
-import { Plus, Pencil, Trash2, Globe, X, Save } from 'lucide-react'
+import { Plus, Pencil, Trash2, Globe, X, Save, Eye, EyeOff, KeyRound } from 'lucide-react'
 import { AppConfirmDialog } from '../components/app-confirm-dialog'
 
 interface SourceForm {
@@ -11,15 +11,26 @@ interface SourceForm {
   login_url: string
   auth_type: string
   vakgebied: string
+  login_gebruikersnaam: string
+  login_wachtwoord: string
 }
 
-const emptyForm: SourceForm = { naam: '', url: '', login_url: '', auth_type: 'none', vakgebied: 'Infrastructuur' }
+const emptyForm: SourceForm = {
+  naam: '',
+  url: '',
+  login_url: '',
+  auth_type: 'none',
+  vakgebied: 'Infrastructuur',
+  login_gebruikersnaam: '',
+  login_wachtwoord: '',
+}
 
 export function SourcesPage() {
   const { data: sources, refresh } = useSources()
   const [editing, setEditing] = useState<string | null>(null)
   const [creating, setCreating] = useState(false)
   const [form, setForm] = useState<SourceForm>(emptyForm)
+  const [showPassword, setShowPassword] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; naam: string } | null>(null)
   const [deleteBusy, setDeleteBusy] = useState(false)
   const [deleteError, setDeleteError] = useState<string | null>(null)
@@ -60,12 +71,15 @@ export function SourcesPage() {
   const startEdit = (source: any) => {
     setEditing(source.id)
     setCreating(false)
+    setShowPassword(false)
     setForm({
       naam: source.naam,
       url: source.url,
       login_url: source.login_url || '',
       auth_type: source.auth_type,
       vakgebied: source.vakgebied || 'Infrastructuur',
+      login_gebruikersnaam: source.login_gebruikersnaam || '',
+      login_wachtwoord: source.login_wachtwoord || '',
     })
   }
 
@@ -133,6 +147,50 @@ export function SourcesPage() {
               </select>
             </div>
           </div>
+          {form.auth_type !== 'none' && (
+            <div className="rounded-lg border border-[var(--border)] bg-[var(--muted)]/30 p-3 space-y-3">
+              <div className="flex items-center gap-1.5 text-xs font-medium text-[var(--muted-foreground)]">
+                <KeyRound className="h-3.5 w-3.5" />
+                Inloggegevens (automatisch invullen bij tracking)
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div>
+                  <label className="text-xs text-[var(--muted-foreground)]">Gebruikersnaam / e-mail</label>
+                  <input
+                    value={form.login_gebruikersnaam}
+                    onChange={e => setForm({ ...form, login_gebruikersnaam: e.target.value })}
+                    autoComplete="off"
+                    className="mt-1 w-full rounded-lg border bg-[var(--background)] px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[var(--ring)]"
+                    placeholder="gebruiker@bedrijf.nl"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-[var(--muted-foreground)]">Wachtwoord</label>
+                  <div className="relative mt-1">
+                    <input
+                      type={showPassword ? 'text' : 'password'}
+                      value={form.login_wachtwoord}
+                      onChange={e => setForm({ ...form, login_wachtwoord: e.target.value })}
+                      autoComplete="new-password"
+                      className="w-full rounded-lg border bg-[var(--background)] px-3 py-2 pr-9 text-sm focus:outline-none focus:ring-2 focus:ring-[var(--ring)]"
+                      placeholder="••••••••"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword(v => !v)}
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
+                      tabIndex={-1}
+                    >
+                      {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <p className="text-[11px] text-[var(--muted-foreground)]">
+                Gegevens worden alleen lokaal opgeslagen en nooit gesynchroniseerd naar de cloud. Ze worden gebruikt om automatisch in te loggen wanneer de tracking start.
+              </p>
+            </div>
+          )}
           <div className="flex gap-2">
             <button onClick={handleSave} className="flex items-center gap-1.5 rounded-lg bg-[var(--primary)] px-4 py-2 text-sm font-medium text-[var(--primary-foreground)] hover:opacity-90">
               <Save className="h-4 w-4" /> Opslaan
@@ -158,6 +216,12 @@ export function SourcesPage() {
                 <span className="rounded bg-[var(--muted)] px-1.5 py-0.5">
                   {source.auth_type === 'none' ? 'Publiek' : source.auth_type === 'form' ? 'Login' : 'OpenID'}
                 </span>
+                {source.auth_type !== 'none' && source.login_gebruikersnaam && (
+                  <span className="flex items-center gap-0.5 rounded bg-green-100 px-1.5 py-0.5 text-green-700 dark:bg-green-900/30 dark:text-green-400">
+                    <KeyRound className="h-2.5 w-2.5" />
+                    Inloggegevens opgeslagen
+                  </span>
+                )}
                 {source.laatste_sync && <span>Sync: {formatDateTime(source.laatste_sync)}</span>}
               </div>
             </div>

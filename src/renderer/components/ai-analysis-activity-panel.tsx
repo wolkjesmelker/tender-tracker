@@ -96,6 +96,15 @@ export function AiAnalysisActivityPanel({ open, onClose, lines, active }: Props)
     el.scrollTop = el.scrollHeight
   }, [open, lines])
 
+  useEffect(() => {
+    if (!open) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [open, onClose])
+
   const handleReset = useCallback(async () => {
     if (!resetConfirm) { setResetConfirm(true); return }
     setResetting(true)
@@ -141,12 +150,18 @@ export function AiAnalysisActivityPanel({ open, onClose, lines, active }: Props)
 
   return (
     <div
-      className="fixed bottom-5 right-5 z-[100] flex w-[min(100vw-1.5rem,28rem)] max-w-[calc(100vw-1.5rem)] flex-col overflow-hidden rounded-xl border border-emerald-500/25 bg-[#0a0f0d] shadow-2xl shadow-black/50 ring-1 ring-white/[0.06]"
-      role="dialog"
-      aria-label="AI-analyse activiteit"
+      className="fixed inset-0 z-[100] bg-black/20"
+      onClick={onClose}
+      role="presentation"
     >
-      {/* ── Title bar ── */}
-      <div className="flex items-center gap-2 border-b border-white/[0.08] bg-[#111916] px-3 py-2">
+      <div
+        className="fixed bottom-5 right-5 flex w-[min(100vw-1.5rem,28rem)] max-w-[calc(100vw-1.5rem)] flex-col overflow-hidden rounded-xl border border-emerald-500/25 bg-[#0a0f0d] shadow-2xl shadow-black/50 ring-1 ring-white/[0.06]"
+        role="dialog"
+        aria-label="AI-analyse activiteit"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* ── Title bar ── */}
+        <div className="flex items-center gap-2 border-b border-white/[0.08] bg-[#111916] px-3 py-2">
         <div className="flex gap-1.5" aria-hidden>
           <span className="h-2 w-2 rounded-full bg-[#ff5f57]/90" />
           <span className="h-2 w-2 rounded-full bg-[#febc2e]/90" />
@@ -174,20 +189,20 @@ export function AiAnalysisActivityPanel({ open, onClose, lines, active }: Props)
         >
           <X className="h-4 w-4" />
         </button>
-      </div>
+        </div>
 
-      {/* ── Current agent bar ── */}
-      {lastAgent ? (
-        <div className="border-b border-white/[0.06] bg-[#0d1411] px-3 py-1.5">
+        {/* ── Current agent bar ── */}
+        {lastAgent ? (
+          <div className="border-b border-white/[0.06] bg-[#0d1411] px-3 py-1.5">
           <p className="text-[10px] font-medium uppercase tracking-wide text-emerald-200/45">Agent</p>
           <p className="truncate font-mono text-[11px] text-cyan-200/90" title={lastAgent}>
             {lastAgent}
           </p>
-        </div>
-      ) : null}
+          </div>
+        ) : null}
 
-      {/* ── Activity log ── */}
-      <div
+        {/* ── Activity log ── */}
+        <div
         ref={scrollRef}
         className="max-h-[min(38vh,300px)] min-h-[180px] overflow-y-auto overflow-x-hidden px-3 py-2.5 font-mono text-[11px] leading-snug [scrollbar-color:rgba(16,185,129,0.35)_transparent]"
       >
@@ -215,10 +230,10 @@ export function AiAnalysisActivityPanel({ open, onClose, lines, active }: Props)
             ))}
           </ul>
         )}
-      </div>
+        </div>
 
-      {/* ── Progress bar ── */}
-      <div className="border-t border-white/[0.08] bg-[#111916] px-3 py-2.5">
+        {/* ── Progress bar ── */}
+        <div className="border-t border-white/[0.08] bg-[#111916] px-3 py-2.5">
         <div className="mb-1 flex items-center justify-between text-[10px] font-medium uppercase tracking-wide text-emerald-200/50">
           <span>Voortgang</span>
           <span className="tabular-nums text-emerald-300/90">{lastPct}%</span>
@@ -229,10 +244,10 @@ export function AiAnalysisActivityPanel({ open, onClose, lines, active }: Props)
             style={{ width: `${Math.min(100, Math.max(0, lastPct))}%` }}
           />
         </div>
-      </div>
+        </div>
 
-      {/* ── Token & model footer ── */}
-      <div className="border-t border-white/[0.06] bg-[#090e0b] px-3 py-3 space-y-3">
+        {/* ── Token & model footer ── */}
+        <div className="border-t border-white/[0.06] bg-[#090e0b] px-3 py-3 space-y-3">
 
         {(mainConfigured || risicoDisplay) && (
           <div>
@@ -386,6 +401,7 @@ export function AiAnalysisActivityPanel({ open, onClose, lines, active }: Props)
             <RotateCcw className={`h-3 w-3 ${resetting ? 'animate-spin' : ''}`} />
             {resetConfirm ? 'Zeker weten? Klik nogmaals om te resetten' : 'Tokenverbruik resetten'}
           </button>
+        </div>
         </div>
       </div>
     </div>

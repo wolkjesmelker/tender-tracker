@@ -17,6 +17,9 @@ import { registerBackupHandlers } from './backup.ipc'
 import { registerDiagnosticsHandlers } from './diagnostics.ipc'
 import { registerAgentHandlers } from './agent.ipc'
 import { registerBedrijfsprofielHandlers } from './bedrijfsprofiel.ipc'
+import { registerSyncHandlers } from './sync.ipc'
+import { registerTenderUpdatesHandlers } from './tender-updates.ipc'
+import { registerReleaseRolloutHandlers } from './release-rollout.ipc'
 
 export function registerAllHandlers(): void {
   registerAppHandlers()
@@ -38,4 +41,7 @@ export function registerAllHandlers(): void {
   registerDiagnosticsHandlers()
   registerAgentHandlers()
   registerBedrijfsprofielHandlers()
+  registerSyncHandlers()
+  registerTenderUpdatesHandlers()
+  registerReleaseRolloutHandlers()
 }

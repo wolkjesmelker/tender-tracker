@@ -22,8 +22,17 @@ import {
   checkContradictionForField,
   persistContradiction,
   buildWizardSteps,
+  listChecklistItems,
+  setChecklistItemDone,
 } from '../ai/document-fill-engine'
-import { searchWeb, pinSearchResultToTender, listPinnedNotes } from '../ai/web-search'
+import {
+  searchWeb,
+  addManualWebSearchToTender,
+  deleteAgentPinnedNote,
+  listPinnedNotes,
+} from '../ai/web-search'
+import { enqueueIncrementalManualDocumentAnalysis } from './analysis.ipc'
+import { buildFilledOriginalExportBuffer } from '../ai/fill-original-export-document'
 import { getAppDataPath } from '../utils/paths'
 import path from 'path'
 import fs from 'fs'
@@ -169,7 +178,36 @@ export function registerAgentHandlers(): void {
 
       const states = listFillStatesForDocument(payload.tenderId, payload.documentNaam)
       const steps = buildWizardSteps(fields)
-      return { ok: true, fields, steps, states }
+      const checklist = listChecklistItems(payload.tenderId, payload.documentNaam)
+      return { ok: true, fields, steps, states, checklist }
+    },
+  )
+
+  ipcMain.handle(
+    IPC.AGENT_GET_DOC_CHECKLIST,
+    (_e, payload: { tenderId: string; documentNaam: string }) => {
+      if (!payload?.tenderId || !payload?.documentNaam) return []
+      return listChecklistItems(payload.tenderId, payload.documentNaam)
+    },
+  )
+
+  ipcMain.handle(
+    IPC.AGENT_TOGGLE_DOC_CHECKLIST_ITEM,
+    (
+      _e,
+      payload: { tenderId: string; documentNaam: string; itemId: string; done: boolean },
+    ) => {
+      if (!payload?.tenderId || !payload?.documentNaam || !payload?.itemId) {
+        return { ok: false, error: 'tenderId, documentNaam en itemId verplicht' }
+      }
+      const item = setChecklistItemDone({
+        tenderId: payload.tenderId,
+        documentNaam: payload.documentNaam,
+        itemId: payload.itemId,
+        done: Boolean(payload.done),
+      })
+      if (!item) return { ok: false, error: 'Item niet gevonden' }
+      return { ok: true, item }
     },
   )
 
@@ -290,19 +328,57 @@ export function registerAgentHandlers(): void {
 
   ipcMain.handle(
     IPC.AGENT_PIN_SEARCH_RESULT,
-    (_e, payload: { tenderId: string; url?: string; summary: string; query?: string }) => {
-      if (!payload?.tenderId || !payload?.summary) {
-        return { ok: false, error: 'tenderId en summary verplicht' }
+    (
+      _e,
+      payload: {
+        tenderId: string
+        url?: string
+        title?: string
+        snippet?: string
+        /** @deprecated single summary-veld; alleen titel+snippet is verplicht */
+        summary?: string
+        query?: string
+        kind?: 'auto' | 'doc_ref' | 'note'
+      },
+    ) => {
+      if (!payload?.tenderId) {
+        return { ok: false, error: 'tenderId verplicht' }
       }
-      const res = pinSearchResultToTender({
+      const kind = payload.kind ?? 'auto'
+      let title = String(payload.title || '').trim()
+      let snippet = String(payload.snippet || '').trim()
+      if (payload.summary && !title && !snippet) {
+        const s = String(payload.summary)
+        const split = s.split(/\s+—\s+|\s+-\s+/)
+        if (split.length > 1) {
+          title = split[0].trim()
+          snippet = split.slice(1).join(' — ').trim()
+        } else {
+          title = s.slice(0, 200)
+          snippet = s.slice(200) || s
+        }
+      }
+      const combined = [title, snippet].filter(Boolean).join(' — ')
+      if (!combined) {
+        return { ok: false, error: 'Titel of fragment ontbreekt' }
+      }
+      const res = addManualWebSearchToTender({
         tenderId: payload.tenderId,
+        title: title || combined,
         url: payload.url,
-        summary: payload.summary,
-        query: payload.query,
+        snippet: snippet || '',
+        searchQuery: payload.query,
+        kind,
       })
-      return { ok: true, id: res.id }
+      if (!res.ok) return res
+      enqueueIncrementalManualDocumentAnalysis(payload.tenderId, [res.textFileName])
+      return { ok: true, id: res.id, resolvedKind: res.resolvedKind, textFileName: res.textFileName }
     },
   )
+
+  ipcMain.handle(IPC.AGENT_DELETE_PINNED_NOTE, (_e, pinId: string) => {
+    return deleteAgentPinnedNote(String(pinId || '').trim())
+  })
 
   ipcMain.handle(
     IPC.AGENT_EXPORT_FILL,
@@ -335,192 +411,72 @@ export function registerAgentHandlers(): void {
 
   ipcMain.handle(
     IPC.AGENT_EXPORT_FILLED_DOCUMENT,
-    async (_e, payload: { tenderId: string; documentNaam: string }) => {
+    async (
+      _e,
+      payload: {
+        tenderId: string
+        documentNaam: string
+        format?: 'pdf' | 'docx'
+      },
+    ) => {
       if (!payload?.tenderId || !payload?.documentNaam) {
         return { ok: false, error: 'tenderId en documentNaam verplicht' }
       }
+      const format = payload.format === 'docx' ? 'docx' : 'pdf'
       const states = listFillStatesForDocument(payload.tenderId, payload.documentNaam)
       const filledStates = states.filter((s) => s.value_text && s.value_text.trim())
       if (filledStates.length === 0) {
         return { ok: false, error: 'Geen ingevulde velden om te exporteren.' }
       }
 
-      // Haal de tender op voor de naam in de header
-      const tender = getDb()
-        .prepare('SELECT titel FROM aanbestedingen WHERE id = ?')
-        .get(payload.tenderId) as { titel?: string } | undefined
-
-      // Groepeer velden
-      const byGroup = new Map<string, typeof states>()
-      for (const s of states) {
-        const g = s.field_group || 'Algemeen'
-        if (!byGroup.has(g)) byGroup.set(g, [])
-        byGroup.get(g)!.push(s)
-      }
-
-      // Genereer PDF met pdfmake
-      let PdfPrinter: any = null
-      try {
-        PdfPrinter = require('pdfmake')
-      } catch {
-        return { ok: false, error: 'pdfmake niet beschikbaar.' }
-      }
-
-      const fonts = {
-        Helvetica: {
-          normal: 'Helvetica',
-          bold: 'Helvetica-Bold',
-          italics: 'Helvetica-Oblique',
-          bolditalics: 'Helvetica-BoldOblique',
-        },
-      }
-
-      const content: any[] = [
-        {
-          text: 'Ingevuld aanbestedingsformulier',
-          style: 'header',
-          margin: [0, 0, 0, 4],
-        },
-        {
-          text: tender?.titel || payload.tenderId,
-          style: 'tenderTitle',
-          margin: [0, 0, 0, 4],
-        },
-        {
-          text: payload.documentNaam,
-          style: 'docTitle',
-          margin: [0, 0, 0, 2],
-        },
-        {
-          text: `Gegenereerd op: ${new Date().toLocaleString('nl-NL', { dateStyle: 'long', timeStyle: 'short' })}`,
-          style: 'meta',
-          margin: [0, 0, 0, 16],
-        },
-        {
-          text: `${filledStates.length} van ${states.length} veld${states.length !== 1 ? 'en' : ''} ingevuld`,
-          style: 'meta',
-          color: filledStates.length === states.length ? '#16a34a' : '#b45309',
-          margin: [0, 0, 0, 20],
-        },
-      ]
-
-      for (const [group, groupStates] of byGroup) {
-        content.push({
-          text: group,
-          style: 'groupHeader',
-          margin: [0, 12, 0, 6],
-        })
-        const tableBody: any[][] = [
-          [
-            { text: 'Veld', bold: true, fillColor: '#f1f5f9', fontSize: 9 },
-            { text: 'Waarde', bold: true, fillColor: '#f1f5f9', fontSize: 9 },
-          ],
-        ]
-        for (const s of groupStates) {
-          const isContradiction = s.contradiction_flag && s.contradiction_detail
-          const isEmpty = !s.value_text?.trim()
-          tableBody.push([
-            {
-              text: `${s.field_label}${s.field_required ? ' *' : ''}`,
-              fontSize: 9,
-              color: '#374151',
-            },
-            {
-              text: isEmpty ? '— (niet ingevuld)' : (s.value_text || ''),
-              fontSize: 9,
-              color: isEmpty ? '#9ca3af' : isContradiction ? '#dc2626' : '#111827',
-              italics: isEmpty,
-            },
-          ])
-          if (isContradiction && s.contradiction_detail) {
-            tableBody.push([
-              { text: '', fontSize: 8 },
-              {
-                text: `⚠ ${s.contradiction_detail}`,
-                fontSize: 8,
-                color: '#dc2626',
-                italics: true,
-              },
-            ])
-          }
-        }
-        content.push({
-          table: {
-            widths: [200, '*'],
-            body: tableBody,
-          },
-          layout: {
-            fillColor: (ri: number) => (ri === 0 ? '#f1f5f9' : ri % 2 === 0 ? '#f8fafc' : null),
-            hLineWidth: () => 0.5,
-            vLineWidth: () => 0.5,
-            hLineColor: () => '#e2e8f0',
-            vLineColor: () => '#e2e8f0',
-          },
-          margin: [0, 0, 0, 8],
-        })
-      }
-
-      // Voettekst
-      content.push({
-        text: '\n* = verplicht veld   ⚠ = tegenstrijdigheid met tendergegevens',
-        style: 'footnote',
-        margin: [0, 12, 0, 0],
-      })
-
-      const docDef = {
-        content,
-        defaultStyle: { font: 'Helvetica', fontSize: 10 },
-        styles: {
-          header: { fontSize: 16, bold: true, color: '#1e3a5f' },
-          tenderTitle: { fontSize: 12, bold: true, color: '#1e3a5f' },
-          docTitle: { fontSize: 10, color: '#4b5563' },
-          meta: { fontSize: 9, color: '#6b7280' },
-          groupHeader: { fontSize: 11, bold: true, color: '#1e40af' },
-          footnote: { fontSize: 8, color: '#9ca3af', italics: true },
-        },
-        pageMargins: [40, 50, 40, 50] as [number, number, number, number],
-      }
-
-      let pdfBuffer: Buffer
-      try {
-        const printer = new PdfPrinter(fonts)
-        const pdfDoc = printer.createPdfKitDocument(docDef)
-        const chunks: Buffer[] = []
-        pdfBuffer = await new Promise<Buffer>((resolve, reject) => {
-          pdfDoc.on('data', (chunk: Buffer) => chunks.push(chunk))
-          pdfDoc.on('end', () => resolve(Buffer.concat(chunks)))
-          pdfDoc.on('error', reject)
-          pdfDoc.end()
-        })
-      } catch (e) {
-        return { ok: false, error: `PDF genereren mislukt: ${e instanceof Error ? e.message : String(e)}` }
-      }
-
-      // Sla op in exports map (automatisch, zonder dialoog) + geef pad terug
       const safeName = payload.documentNaam.replace(/[^a-zA-Z0-9._\-]/g, '_')
-      const baseName = `${safeName}_ingevuld_${Date.now()}.pdf`
       const exportsDir = path.join(getAppDataPath(), 'filled-documents', payload.tenderId)
       fs.mkdirSync(exportsDir, { recursive: true })
-      const autoPath = path.join(exportsDir, baseName)
-      fs.writeFileSync(autoPath, pdfBuffer)
 
-      // Bied ook save-as dialoog aan via BrowserWindow
+      let outBuffer: Buffer
+      let exportWarnings: string[] = []
+      try {
+        const built = await buildFilledOriginalExportBuffer({
+          tenderId: payload.tenderId,
+          documentNaam: payload.documentNaam,
+          states,
+          format,
+        })
+        outBuffer = built.buffer
+        exportWarnings = built.warnings || []
+        if (exportWarnings.length) {
+          log.info(`[agent.ipc] export waarschuwingen (${payload.documentNaam}):`, exportWarnings.join(' | '))
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
+        log.warn('[agent.ipc] export brondocument:', msg)
+        return { ok: false, error: msg }
+      }
+
+      const ext = format === 'docx' ? 'docx' : 'pdf'
+      const baseName = `${safeName}_ingevuld_${Date.now()}.${ext}`
+      const autoPath = path.join(exportsDir, baseName)
+      fs.writeFileSync(autoPath, outBuffer)
+
       const win = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0]
-      const defaultFileName = `${safeName}_ingevuld.pdf`
+      const defaultFileName = `${safeName}_ingevuld.${ext}`
       const saveResult = win
         ? await dialog.showSaveDialog(win, {
-            title: 'Ingevuld document opslaan',
+            title:
+              format === 'docx'
+                ? 'Ingevuld brondocument opslaan (Word)'
+                : 'Ingevuld brondocument opslaan (PDF)',
             defaultPath: defaultFileName,
-            filters: [{ name: 'PDF', extensions: ['pdf'] }],
+            filters: [{ name: format === 'docx' ? 'Word' : 'PDF', extensions: [ext] }],
           })
         : { canceled: true, filePath: undefined }
 
       if (!saveResult.canceled && saveResult.filePath) {
         fs.copyFileSync(autoPath, saveResult.filePath)
-        return { ok: true, filePath: saveResult.filePath, autoPath }
+        return { ok: true, filePath: saveResult.filePath, autoPath, warnings: exportWarnings }
       }
 
-      return { ok: true, filePath: autoPath, autoPath }
+      return { ok: true, filePath: autoPath, autoPath, warnings: exportWarnings }
     },
   )
 }

@@ -1,4 +1,5 @@
 import React, { useMemo, useState } from 'react'
+import { BronPageEmbedModal } from './bron-page-embed'
 import {
   Building2, MapPin, CalendarDays, Euro, Hash, FileCheck, ExternalLink,
   Clock, ClipboardList,
@@ -13,6 +14,8 @@ import type {
   ProcedureTimelineStep,
 } from '../../shared/types'
 import { formatDate, formatDateTime } from '../lib/utils'
+import { parseTenderDisplayDate } from '../../shared/date-format'
+import { analyzeTenderTimelineConsistency } from '../../shared/tender-timeline-validation'
 
 interface InschrijvingTabProps {
   tender: Aanbesteding
@@ -22,23 +25,28 @@ interface InschrijvingTabProps {
   bronNavLinks: BronNavigatieLink[]
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+type TextUrlSegment =
+  | { kind: 'text'; text: string }
+  | { kind: 'url'; url: string }
 
-/** Parse a loose date string (ISO or dd-mm-yyyy) to a Date. Returns null if invalid. */
-function parseLooseDate(s?: string | null): Date | null {
-  if (!s || typeof s !== 'string') return null
-  const t = s.trim()
-  if (!t) return null
-  // dd-mm-yyyy
-  const dm = t.match(/^(\d{1,2})-(\d{1,2})-(\d{4})(?:[ T](\d{1,2}):(\d{2}))?/)
-  if (dm) {
-    const d = new Date(Number(dm[3]), Number(dm[2]) - 1, Number(dm[1]),
-      dm[4] ? Number(dm[4]) : 0, dm[5] ? Number(dm[5]) : 0)
-    return isNaN(d.getTime()) ? null : d
+/** Splits platte tekst op http(s)-URL’s zodat die in de app in een modal-webview geopend kunnen worden. */
+function splitTextWithHttpUrls(raw: string): TextUrlSegment[] {
+  const s = String(raw ?? '')
+  const re = /(https?:\/\/[^\s<>"']+)/gi
+  const out: TextUrlSegment[] = []
+  let last = 0
+  let m: RegExpExecArray | null
+  while ((m = re.exec(s)) !== null) {
+    if (m.index > last) out.push({ kind: 'text', text: s.slice(last, m.index) })
+    const url = m[1]!.replace(/[.,;:!?)#]+$/u, '')
+    if (url.length > 0) out.push({ kind: 'url', url })
+    last = m.index + m[0].length
   }
-  const d = new Date(t)
-  return isNaN(d.getTime()) ? null : d
+  if (last < s.length) out.push({ kind: 'text', text: s.slice(last) })
+  return out.length > 0 ? out : [{ kind: 'text', text: s }]
 }
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 function daysBetween(a: Date, b: Date): number {
   const MS = 24 * 60 * 60 * 1000
@@ -70,10 +78,10 @@ function buildEnrichedTimeline(
   const hasId = (id: string) => steps.some((s) => s.id === id)
   const hasDateMatch = (iso?: string) => {
     if (!iso) return false
-    const d = parseLooseDate(iso)
+    const d = parseTenderDisplayDate(iso)
     if (!d) return false
     return steps.some((s) => {
-      const sd = parseLooseDate(s.date)
+      const sd = s.date ? parseTenderDisplayDate(s.date) : null
       return sd && Math.abs(sd.getTime() - d.getTime()) < 60_000
     })
   }
@@ -112,7 +120,7 @@ function buildEnrichedTimeline(
   }
 
   const enriched: EnrichedTimelineStep[] = steps.map((s) => {
-    const parsedDate = parseLooseDate(s.date)
+    const parsedDate = s.date ? parseTenderDisplayDate(s.date) : null
     const daysFromToday = parsedDate ? daysBetween(now, parsedDate) : null
     let phase: TimelinePhase = 'undated'
     if (parsedDate && daysFromToday !== null) {
@@ -217,6 +225,7 @@ export function InschrijvingTab({
   criteriaScores: _criteriaScores,
   bronNavLinks,
 }: InschrijvingTabProps) {
+  const [bronEmbed, setBronEmbed] = useState<{ url: string; title: string } | null>(null)
   const timelineItems = useMemo(
     () => buildEnrichedTimeline(procedureContext?.timeline, aiExtracted),
     [procedureContext, aiExtracted]
@@ -233,7 +242,29 @@ export function InschrijvingTab({
   const dispSluiting = tender.sluitingsdatum || aiExtracted.sluitingsdatum_inschrijving || procedureContext?.apiHighlights?.sluitingsDatum
   const dispCpv = aiExtracted.cpv_of_werkzaamheden
 
-  const sluitingDate = parseLooseDate(dispSluiting)
+  const sluitingDate = dispSluiting ? parseTenderDisplayDate(dispSluiting) : null
+
+  const timelineConsistencyIssues = useMemo(
+    () =>
+      analyzeTenderTimelineConsistency({
+        publicatie: dispPublicatie,
+        sluitingInschrijving: dispSluiting,
+        startUitvoering: aiExtracted.datum_start_uitvoering,
+        eindeUitvoering: aiExtracted.datum_einde_uitvoering,
+      }),
+    [
+      dispPublicatie,
+      dispSluiting,
+      aiExtracted.datum_start_uitvoering,
+      aiExtracted.datum_einde_uitvoering,
+    ],
+  )
+
+  const indieningAdresSegments = useMemo(
+    () =>
+      aiExtracted.indiening_adres ? splitTextWithHttpUrls(aiExtracted.indiening_adres) : [],
+    [aiExtracted.indiening_adres],
+  )
 
   // Categorize submission platforms from bron_navigatie_links
   const platformRe = /platform|extern|inschrijving|aanbesteding|tenderned|mercell|negometrix|s2c|ted\.europa|eforms/i
@@ -494,6 +525,30 @@ export function InschrijvingTab({
           <h2 className="text-base font-semibold">Procedureverloop &amp; Tijdslijn</h2>
         </div>
 
+        {timelineConsistencyIssues.length > 0 && (
+          <div
+            className="mb-5 rounded-lg border border-amber-500/50 bg-amber-500/10 p-4"
+            role="alert"
+          >
+            <div className="flex gap-3">
+              <AlertTriangle className="h-5 w-5 shrink-0 text-amber-600" />
+              <div className="min-w-0 space-y-2">
+                <p className="text-sm font-semibold text-[var(--foreground)]">
+                  Inconsistenties in de mijlpaaldatums
+                </p>
+                <p className="text-xs text-[var(--muted-foreground)]">
+                  Onderstaande punten komen vaak door verkeerde extractie of dubbelzinnige notatie. Controleer altijd de originele aanbestedingsstukken.
+                </p>
+                <ul className="list-disc space-y-1.5 pl-4 text-xs text-[var(--foreground)]">
+                  {timelineConsistencyIssues.map((issue) => (
+                    <li key={issue.id}>{issue.message}</li>
+                  ))}
+                </ul>
+              </div>
+            </div>
+          </div>
+        )}
+
         {timelineItems.length === 0 ? (
           <div className="rounded-lg border border-dashed border-[var(--border)] bg-[var(--muted)]/20 p-6 text-center">
             <Clock className="h-8 w-8 mx-auto text-[var(--muted-foreground)] mb-2" />
@@ -737,7 +792,25 @@ export function InschrijvingTab({
               <Navigation className="h-3.5 w-3.5" /> Aanvraag / inschrijving indienen bij
             </p>
             <p className="text-sm text-[var(--foreground)] whitespace-pre-line leading-relaxed">
-              {aiExtracted.indiening_adres}
+              {indieningAdresSegments.map((seg, i) =>
+                seg.kind === 'text' ? (
+                  <React.Fragment key={i}>{seg.text}</React.Fragment>
+                ) : (
+                  <button
+                    key={i}
+                    type="button"
+                    onClick={() =>
+                      setBronEmbed({
+                        url: seg.url,
+                        title: 'Aanvraag / inschrijving indienen bij',
+                      })
+                    }
+                    className="inline break-all text-left font-medium text-[var(--primary)] underline decoration-[var(--primary)]/40 underline-offset-2 hover:underline"
+                  >
+                    {seg.url}
+                  </button>
+                ),
+              )}
             </p>
           </div>
         )}
@@ -791,6 +864,14 @@ export function InschrijvingTab({
           </div>
         </div>
       )}
+
+      <BronPageEmbedModal
+        open={bronEmbed != null}
+        url={bronEmbed?.url ?? ''}
+        title={bronEmbed?.title ?? 'Pagina'}
+        tenderId={tender.id}
+        onClose={() => setBronEmbed(null)}
+      />
     </div>
   )
 }

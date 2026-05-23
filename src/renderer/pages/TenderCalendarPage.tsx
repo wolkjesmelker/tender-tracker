@@ -1,7 +1,6 @@
 import { useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useTenders, useSources } from '../hooks/use-ipc'
-import { api, isElectron } from '../lib/ipc-client'
 import {
   getStatusLabel,
   getStatusColor,
@@ -13,10 +12,9 @@ import {
   Search,
   Filter,
   ArrowRight,
-  ExternalLink,
-  FileText,
   RotateCcw,
-  X,
+  CalendarDays,
+  ChevronUp,
 } from 'lucide-react'
 import type { Aanbesteding } from '@shared/types'
 import {
@@ -95,6 +93,53 @@ function matchesQuickPreset(
   }
 }
 
+const NO_END_KEY = '__geen_sluitingsdatum__'
+
+function monthKeyFromDate(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+}
+
+function monthSortValue(key: string): number {
+  if (key === NO_END_KEY) return Number.POSITIVE_INFINITY
+  const [y, m] = key.split('-').map((x) => parseInt(x, 10))
+  if (!y || !m) return Number.POSITIVE_INFINITY
+  return y * 12 + (m - 1)
+}
+
+function formatMonthHeading(d: Date): string {
+  const raw = d.toLocaleDateString('nl-NL', { month: 'long', year: 'numeric' })
+  return raw.charAt(0).toUpperCase() + raw.slice(1)
+}
+
+function groupTendersByClosingMonth(rows: Aanbesteding[]): {
+  key: string
+  heading: string
+  items: Aanbesteding[]
+}[] {
+  const map = new Map<string, Aanbesteding[]>()
+  for (const row of rows) {
+    const w = getInschrijvingWindow(row)
+    const k = w.end ? monthKeyFromDate(w.end) : NO_END_KEY
+    const list = map.get(k)
+    if (list) list.push(row)
+    else map.set(k, [row])
+  }
+  const keys = [...map.keys()].sort((a, b) => monthSortValue(a) - monthSortValue(b))
+  return keys.map((key) => {
+    const items = map.get(key) ?? []
+    let heading: string
+    if (key === NO_END_KEY) {
+      heading = 'Geen sluitingsdatum'
+    } else {
+      const [ys, ms] = key.split('-')
+      const y = parseInt(ys, 10)
+      const m = parseInt(ms, 10)
+      heading = formatMonthHeading(new Date(y, m - 1, 1))
+    }
+    return { key, heading, items }
+  })
+}
+
 export function TenderCalendarPage() {
   const { data: tenders, loading, refresh } = useTenders({ showVerlopen: 'all' })
   const { data: sources } = useSources()
@@ -106,13 +151,12 @@ export function TenderCalendarPage() {
   const [startFrom, setStartFrom] = useState('')
   const [startTo, setStartTo] = useState('')
   const [endFrom, setEndFrom] = useState('')
+  const [filtersOpen, setFiltersOpen] = useState(false)
   const [endTo, setEndTo] = useState('')
   const [origin, setOrigin] = useState<'all' | 'scraped' | 'upload'>('all')
   const [typeFilter, setTypeFilter] = useState('')
   const [minScore, setMinScore] = useState('')
   const [sortKey, setSortKey] = useState<SortKey>('end_asc')
-
-  const [detail, setDetail] = useState<Aanbesteding | null>(null)
 
   const typeOptions = useMemo(() => {
     const set = new Set<string>()
@@ -199,6 +243,11 @@ export function TenderCalendarPage() {
     sortKey,
   ])
 
+  const byClosingMonth = useMemo(
+    () => groupTendersByClosingMonth(filteredSorted),
+    [filteredSorted]
+  )
+
   const hasActiveFilters =
     search ||
     statusFilter ||
@@ -228,13 +277,6 @@ export function TenderCalendarPage() {
     setSortKey('end_asc')
   }
 
-  const openBron = (url?: string | null) => {
-    const u = url?.trim()
-    if (!u) return
-    if (isElectron) void api.openExternal(u)
-    else window.open(u, '_blank', 'noopener,noreferrer')
-  }
-
   return (
     <div className="space-y-6">
       <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
@@ -244,8 +286,8 @@ export function TenderCalendarPage() {
             Aanbestedingskalender
           </h1>
           <p className="mt-1 text-sm text-[var(--muted-foreground)] max-w-2xl">
-            Overzicht van publicatie- en sluitingsdata van gescrapete en geïmporteerde aanbestedingen.
-            Klik op een kaart voor details en een link naar de volledige record.
+            Tenders staan gegroepeerd per <strong className="font-medium text-[var(--foreground)]">sluitingsmaand</strong>{' '}
+            (kalenderweergave). Klik op een kaart om de volledige aanbesteding te openen.
           </p>
         </div>
         <button
@@ -258,21 +300,43 @@ export function TenderCalendarPage() {
       </div>
 
       {/* Filters */}
-      <div className="rounded-2xl border bg-[var(--card)] p-4 shadow-sm space-y-4">
-        <div className="flex flex-wrap items-center gap-2">
+      <div className="rounded-2xl border bg-[var(--card)] shadow-sm">
+        {/* Header — altijd zichtbaar */}
+        <button
+          type="button"
+          onClick={() => setFiltersOpen((v) => !v)}
+          className="flex w-full items-center gap-2 px-4 py-3 text-left"
+        >
           <Filter className="h-4 w-4 text-[var(--muted-foreground)]" aria-hidden />
           <span className="text-sm font-medium text-[var(--foreground)]">Filters</span>
-          {hasActiveFilters && (
-            <button
-              type="button"
-              onClick={resetFilters}
-              className="ml-auto inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-xs text-[var(--muted-foreground)] hover:bg-[var(--muted)]"
-            >
-              <RotateCcw className="h-3.5 w-3.5" />
-              Wis filters
-            </button>
+          {hasActiveFilters && !filtersOpen && (
+            <span className="rounded-full bg-[var(--primary)] px-1.5 py-0.5 text-[9px] font-bold text-[var(--primary-foreground)]">
+              actief
+            </span>
           )}
-        </div>
+          <div className="ml-auto flex items-center gap-2">
+            {hasActiveFilters && (
+              <button
+                type="button"
+                onClick={(e) => { e.stopPropagation(); resetFilters() }}
+                className="inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-xs text-[var(--muted-foreground)] hover:bg-[var(--muted)]"
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+                Wis filters
+              </button>
+            )}
+            <span className="text-[11px] text-[var(--muted-foreground)]">
+              {loading ? '…' : `${filteredSorted.length} van ${(tenders as unknown[])?.length ?? 0}`}
+            </span>
+            <ChevronUp
+              className={`h-4 w-4 text-[var(--muted-foreground)] transition-transform duration-200 ${filtersOpen ? '' : 'rotate-180'}`}
+            />
+          </div>
+        </button>
+
+        {/* Inklapbaar gedeelte */}
+        {filtersOpen && (
+          <div className="border-t border-[var(--border)] p-4 space-y-4">
 
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           <div className="relative">
@@ -455,6 +519,8 @@ export function TenderCalendarPage() {
         <p className="text-xs text-[var(--muted-foreground)]">
           {loading ? 'Laden…' : `${filteredSorted.length} van ${(tenders as unknown[])?.length ?? 0} aanbestedingen`}
         </p>
+          </div>
+        )}
       </div>
 
       {/* Grid */}
@@ -467,129 +533,102 @@ export function TenderCalendarPage() {
           Geen aanbestedingen voor deze filters. Pas de filters aan of wis ze.
         </div>
       ) : (
-        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-          {filteredSorted.map((row) => {
-            const w = getInschrijvingWindow(row)
-            return (
-              <button
-                key={row.id}
-                type="button"
-                onClick={() => setDetail(row)}
-                className="group text-left rounded-2xl border bg-gradient-to-br from-[var(--primary)]/[0.06] via-[var(--card)] to-[var(--card)] p-5 shadow-sm transition-all hover:shadow-md hover:border-[var(--primary)]/35 focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)]"
-              >
-                <div className="flex items-start justify-between gap-2">
-                  <h2 className="line-clamp-2 text-sm font-semibold leading-snug text-[var(--foreground)] group-hover:text-[var(--primary)]">
-                    {row.titel}
-                  </h2>
-                  <span
-                    className={cn(
-                      'shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide',
-                      getStatusColor(row.status)
+        <div className="space-y-10">
+          {byClosingMonth.map((section) => (
+            <section
+              key={section.key}
+              className="scroll-mt-4"
+              aria-labelledby={`cal-section-${section.key}`}
+            >
+              <div className="mb-4 flex flex-wrap items-end gap-3 border-b border-[var(--border)] pb-3">
+                <div className="flex min-w-0 items-center gap-2.5">
+                  <div
+                    className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border bg-[var(--card)] text-[var(--primary)] shadow-sm"
+                    aria-hidden
+                  >
+                    <CalendarDays className="h-5 w-5" />
+                  </div>
+                  <div>
+                    <h2
+                      id={`cal-section-${section.key}`}
+                      className="text-lg font-semibold tracking-tight text-[var(--foreground)]"
+                    >
+                      {section.heading}
+                    </h2>
+                    {section.key !== NO_END_KEY ? (
+                      <p className="text-xs text-[var(--muted-foreground)]">
+                        Sluitingsdata in deze periode
+                      </p>
+                    ) : (
+                      <p className="text-xs text-[var(--muted-foreground)]">
+                        Nog geen einddatum bekend; handmatig in detail bekijken
+                      </p>
                     )}
-                  >
-                    {getStatusLabel(row.status)}
-                  </span>
-                </div>
-                <div className="mt-4 flex flex-wrap items-end gap-3 text-sm text-[var(--foreground)]">
-                  <div>
-                    <p className="text-[10px] font-medium uppercase tracking-wide text-[var(--muted-foreground)]">
-                      Publicatie
-                    </p>
-                    <span className="mt-0.5 inline-block rounded-lg bg-[var(--muted)]/80 px-2.5 py-1 font-medium tabular-nums">
-                      {w.startDisplay}
-                    </span>
-                  </div>
-                  <ArrowRight className="mb-1.5 h-4 w-4 shrink-0 text-[var(--muted-foreground)]" aria-hidden />
-                  <div>
-                    <p className="text-[10px] font-medium uppercase tracking-wide text-[var(--muted-foreground)]">
-                      Sluiting
-                    </p>
-                    <span className="mt-0.5 inline-block rounded-lg bg-[var(--muted)]/80 px-2.5 py-1 font-medium tabular-nums">
-                      {w.endDisplay}
-                    </span>
                   </div>
                 </div>
-                <p className="mt-3 text-xs text-[var(--muted-foreground)] line-clamp-1">
-                  {row.bron_website_naam || (row.is_upload ? 'Upload' : 'Onbekende bron')}
-                  {row.opdrachtgever ? ` · ${row.opdrachtgever}` : ''}
-                </p>
-              </button>
-            )
-          })}
-        </div>
-      )}
+                <span className="ml-auto inline-flex items-center rounded-full border bg-[var(--muted)]/50 px-2.5 py-0.5 text-xs font-medium tabular-nums text-[var(--foreground)]">
+                  {section.items.length}{' '}
+                  {section.items.length === 1 ? 'aanbesteding' : 'aanbestedingen'}
+                </span>
+              </div>
 
-      {/* Detail modal */}
-      {detail && (
-        <div
-          className="fixed inset-0 z-[100] flex items-center justify-center bg-black/45 p-4"
-          role="dialog"
-          aria-modal="true"
-          onClick={(e) => e.target === e.currentTarget && setDetail(null)}
-        >
-          <div
-            className="w-full max-w-lg rounded-2xl border bg-[var(--card)] shadow-xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-start justify-between gap-3 border-b px-5 py-4">
-              <div className="min-w-0">
-                <p className="text-xs font-medium uppercase tracking-wide text-[var(--muted-foreground)]">
-                  Inschrijving
-                </p>
-                <h2 className="mt-1 text-base font-semibold text-[var(--foreground)] leading-snug">
-                  {detail.titel}
-                </h2>
-              </div>
-              <button
-                type="button"
-                onClick={() => setDetail(null)}
-                className="rounded-lg p-2 hover:bg-[var(--muted)]"
-                aria-label="Sluiten"
-              >
-                <X className="h-5 w-5" />
-              </button>
-            </div>
-            <div className="space-y-4 px-5 py-4">
-              <div className="grid gap-3 sm:grid-cols-2">
-                <div className="rounded-xl border bg-[var(--background)] p-3">
-                  <p className="text-xs text-[var(--muted-foreground)]">Start inschrijving</p>
-                  <p className="mt-1 text-sm font-semibold tabular-nums">
-                    {getInschrijvingWindow(detail).startDisplay}
-                  </p>
-                </div>
-                <div className="rounded-xl border bg-[var(--background)] p-3">
-                  <p className="text-xs text-[var(--muted-foreground)]">Einde inschrijving</p>
-                  <p className="mt-1 text-sm font-semibold tabular-nums">
-                    {getInschrijvingWindow(detail).endDisplay}
-                  </p>
-                </div>
-              </div>
-              <p className="text-[11px] text-[var(--muted-foreground)]">
-                Waarden zijn afgeleid uit opgeslagen publicatie- en sluitingsdata (eventueel aangevuld via TenderNed/API of AI).
-              </p>
-
-              <div className="flex flex-col gap-2 sm:flex-row">
-                <Link
-                  to={`/aanbestedingen/${detail.id}`}
-                  onClick={() => setDetail(null)}
-                  className="inline-flex flex-1 items-center justify-center gap-2 rounded-xl bg-[var(--primary)] px-4 py-2.5 text-sm font-medium text-[var(--primary-foreground)] hover:opacity-90"
-                >
-                  <FileText className="h-4 w-4" />
-                  Volledige aanbesteding
-                </Link>
-                {detail.bron_url?.trim() ? (
-                  <button
-                    type="button"
-                    onClick={() => openBron(detail.bron_url)}
-                    className="inline-flex flex-1 items-center justify-center gap-2 rounded-xl border px-4 py-2.5 text-sm font-medium hover:bg-[var(--muted)]"
-                  >
-                    <ExternalLink className="h-4 w-4" />
-                    Bronpagina
-                  </button>
-                ) : null}
-              </div>
-            </div>
-          </div>
+              <ul className="grid list-none gap-3 sm:grid-cols-2 xl:grid-cols-3">
+                {section.items.map((row) => {
+                  const w = getInschrijvingWindow(row)
+                  return (
+                    <li key={row.id}>
+                      <Link
+                        to={`/aanbestedingen/${row.id}`}
+                        className="group block h-full text-left rounded-2xl border bg-gradient-to-br from-[var(--primary)]/[0.06] via-[var(--card)] to-[var(--card)] p-5 shadow-sm transition-all hover:shadow-md hover:border-[var(--primary)]/35 focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)]"
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <h3 className="line-clamp-2 text-sm font-semibold leading-snug text-[var(--foreground)] group-hover:text-[var(--primary)]">
+                            {row.titel}
+                          </h3>
+                          <span
+                            className={cn(
+                              'shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide',
+                              getStatusColor(row.status)
+                            )}
+                          >
+                            {getStatusLabel(row.status)}
+                          </span>
+                        </div>
+                        <div className="mt-4 flex flex-wrap items-end gap-3 text-sm text-[var(--foreground)]">
+                          <div>
+                            <p className="text-[10px] font-medium uppercase tracking-wide text-[var(--muted-foreground)]">
+                              Publicatie
+                            </p>
+                            <span className="mt-0.5 inline-block rounded-lg bg-[var(--muted)]/80 px-2.5 py-1 font-medium tabular-nums">
+                              {w.startDisplay}
+                            </span>
+                          </div>
+                          <ArrowRight className="mb-1.5 h-4 w-4 shrink-0 text-[var(--muted-foreground)]" aria-hidden />
+                          <div>
+                            <p className="text-[10px] font-medium uppercase tracking-wide text-[var(--muted-foreground)]">
+                              Sluiting
+                            </p>
+                            <span className="mt-0.5 inline-block rounded-lg bg-[var(--muted)]/80 px-2.5 py-1 font-medium tabular-nums">
+                              {w.endDisplay}
+                            </span>
+                          </div>
+                        </div>
+                        <p className="mt-3 flex items-center justify-between gap-2 text-xs text-[var(--muted-foreground)]">
+                          <span className="line-clamp-1 min-w-0">
+                            {row.bron_website_naam || (row.is_upload ? 'Upload' : 'Onbekende bron')}
+                            {row.opdrachtgever ? ` · ${row.opdrachtgever}` : ''}
+                          </span>
+                          <span className="shrink-0 text-[10px] font-medium uppercase text-[var(--primary)] opacity-0 transition-opacity group-hover:opacity-100">
+                            Openen →
+                          </span>
+                        </p>
+                      </Link>
+                    </li>
+                  )
+                })}
+              </ul>
+            </section>
+          ))}
         </div>
       )}
     </div>

@@ -1,4 +1,5 @@
 import type { Aanbesteding, AiExtractedTenderFields, TenderProcedureContext } from '@shared/types'
+import { parseTenderDisplayDate } from '@shared/date-format'
 import { formatDate } from './utils'
 
 function parseJson<T>(raw: unknown): T | null {
@@ -8,12 +9,6 @@ function parseJson<T>(raw: unknown): T | null {
   } catch {
     return null
   }
-}
-
-function parseDate(s?: string | null): Date | null {
-  if (!s?.trim()) return null
-  const d = new Date(s.trim().replace(/(\.\d{3})\d+/g, '$1'))
-  return Number.isNaN(d.getTime()) ? null : d
 }
 
 export type InschrijvingWindow = {
@@ -36,7 +31,7 @@ export function getInschrijvingWindow(row: Aanbesteding): InschrijvingWindow {
   for (const raw of [row.sluitingsdatum, typeof apiEnd === 'string' ? apiEnd : '', ai?.sluitingsdatum_inschrijving]) {
     const r = raw?.trim()
     if (!r) continue
-    const d = parseDate(r)
+    const d = parseTenderDisplayDate(r)
     if (d) {
       end = d
       endRaw = r
@@ -49,7 +44,7 @@ export function getInschrijvingWindow(row: Aanbesteding): InschrijvingWindow {
   for (const raw of [row.publicatiedatum, ai?.publicatiedatum]) {
     const r = raw?.trim()
     if (!r) continue
-    const d = parseDate(r)
+    const d = parseTenderDisplayDate(r)
     if (d) {
       start = d
       startRaw = r

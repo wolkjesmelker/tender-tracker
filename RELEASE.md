@@ -3,16 +3,14 @@
 ## Vereisten
 
 - Node.js 20+, npm
-- macOS met Xcode Command Line Tools (`xcode-select --install`)
-- Toegang tot de release-server: `https://releases.questric.eu/tendertracker/`
+- Git-toegang tot `https://github.com/wolkjesmelker/tender-tracker`
+- Geen server, geen handmatige uploads — GitHub doet het automatisch ✓
 
 ---
 
-## Nieuwe versie uitbrengen (vanuit Cursor)
+## Nieuwe versie uitbrengen vanuit Cursor
 
-### Stap 1 — Versienummer verhogen
-
-Open een terminal in `tender-tracker/` en kies het juiste commando:
+Open een terminal in de map `tender-tracker/` en kies het juiste commando:
 
 | Type wijziging | Commando | Voorbeeld |
 |---|---|---|
@@ -20,29 +18,16 @@ Open een terminal in `tender-tracker/` en kies het juiste commando:
 | Nieuwe functies | `npm run release:minor` | 1.0.0 → 1.1.0 |
 | Grote herziening / breaking change | `npm run release:major` | 1.0.0 → 2.0.0 |
 
-Dit commando:
-1. Verhoogt automatisch het versienummer in `package.json`
-2. Bouwt de volledige Electron-app (renderer + main + preload)
-3. Genereert een `.dmg` installatiepakket in `tender-tracker/release/`
+**Wat er automatisch gebeurt:**
 
-### Stap 2 — Bestanden uploaden naar de release-server
+1. Versienummer verhoogd in `package.json`
+2. Commit aangemaakt met bericht `chore: release vX.Y.Z`
+3. Versie-tag gepusht naar GitHub (`vX.Y.Z`)
+4. **GitHub Actions** pikt de tag op en bouwt macOS + Windows installers
+5. GitHub Release aangemaakt met alle bestanden
+6. Gebruikers zien de update-melding binnen 10 seconden na het openen van de app
 
-Upload de volgende bestanden vanuit `tender-tracker/release/` naar:
-`https://releases.questric.eu/tendertracker/`
-
-| Bestand | Omschrijving |
-|---|---|
-| `TenderTracker-X.Y.Z-mac-x64.dmg` | Installer voor Intel Mac |
-| `TenderTracker-X.Y.Z-mac-arm64.dmg` | Installer voor Apple Silicon (M1/M2/M3) |
-| `TenderTracker-X.Y.Z-mac-x64.zip` | Zip voor auto-update (Intel) |
-| `TenderTracker-X.Y.Z-mac-arm64.zip` | Zip voor auto-update (Apple Silicon) |
-| `latest-mac.yml` | **Verplicht** — bevat versienummer en checksums voor auto-update |
-
-> **Belangrijk:** `latest-mac.yml` moet altijd worden geüpload — dit is het bestand dat de draaiende app gebruikt om te controleren of er een update beschikbaar is.
-
-### Stap 3 — Klaar
-
-Gebruikers met een geïnstalleerde versie krijgen binnen 10 seconden na het openen van de app een update-melding te zien.
+Voortgang bekijken: **https://github.com/wolkjesmelker/tender-tracker/actions**
 
 ---
 
@@ -52,14 +37,14 @@ Gebruikers met een geïnstalleerde versie krijgen binnen 10 seconden na het open
 Gebruiker opent app
     │
     ▼ (na 10 seconden)
-App checkt latest-mac.yml op releases.questric.eu
+App checkt GitHub Releases (latest-mac.yml / latest.yml)
     │
     ├── Geen nieuwe versie → niets
     │
     └── Nieuwe versie gevonden
             │
             ▼
-        Update-modal verschijnt
+        Update-modal verschijnt (in de app)
             │
             ▼
         Gebruiker klikt "Downloaden & installeren"
@@ -91,24 +76,22 @@ Deze map wordt **nooit** overschreven door een update — data is altijd veilig.
 
 ---
 
-## Alleen de DMG bouwen (zonder versie verhogen)
+## Alleen lokaal bouwen (zonder release)
 
 ```bash
- run dist:macnpm
+npm run dist:mac     # macOS DMG in tender-tracker/release/
+npm run dist:win     # Windows installer in tender-tracker/release/
 ```
-
-De DMG staat daarna in `tender-tracker/release/`.
 
 ---
 
-## Automatisch publiceren (optioneel)
+## GitHub Actions instellen (eenmalig)
 
-Als de release-server een write-API of SCP-toegang heeft, kun je instellen dat
-`electron-builder` direct publiceert:
+De workflow gebruikt `GITHUB_TOKEN` dat automatisch beschikbaar is in GitHub Actions — geen extra secrets nodig.
 
-```bash
-npm run release:publish
-```
+Optioneel, voor macOS code-signing (verwijdert Gatekeeper-waarschuwing):
+1. Zet `CSC_LINK` (base64-gecodeerd .p12-certificaat) als GitHub-secret
+2. Zet `CSC_KEY_PASSWORD` als GitHub-secret
+3. De workflow pikt ze automatisch op
 
-Dit vereist dat `GH_TOKEN` of een custom publicatie-plugin geconfigureerd is in `electron-builder.yml`.
-Zie: https://www.electron.build/configuration/publish
+Zonder code-signing: gebruikers kiezen rechtermuisknop → **Openen** bij de eerste start.

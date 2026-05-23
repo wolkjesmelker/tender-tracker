@@ -1,12 +1,58 @@
 import { getDb } from '../db/connection'
-import { BrowserWindow, session } from 'electron'
+import { requestDebouncedCloudPush } from '../db/supabase-sync'
+import { BrowserWindow, session, webContents } from 'electron'
 import log from 'electron-log'
 import { acquireBusyWorkBlocker, releaseBusyWorkBlocker } from '../utils/busy-work-blocker'
+import { keepWebContentsActiveForBackgroundWork } from '../utils/keep-webcontents-active'
 import type { BronWebsite, ScrapeProgress } from '../../shared/types'
+import { IPC } from '../../shared/constants'
 import { qualifiesVoorVanDeKreekeScrape } from './scrape-qualification'
+import { filterTenderIdsForAutoPostScrapeAnalysis } from '../utils/post-scrape-auto-analysis-filter'
+import {
+  filterTendersExcludingPersonnelHeadersWithGpt4o,
+  shouldSkipListItemForPersonnelHeaderGpt4o,
+} from './header-personnel-vacancy-gate'
 import { markSiteAsLoggedIn, markSiteAsLoggedOut } from '../ipc/auth.ipc'
 import { discoverDocumentsFromBronWithAi } from '../ai/document-discovery'
 import { fetchTenderNedFromTnsApi } from './document-fetcher'
+
+/**
+ * Registreer tenders die nieuwe documenten hebben gekregen (of voor het eerst analyseerbaar zijn)
+ * in de `tender_updates` tabel en stuur een IPC-push naar de renderer.
+ *
+ * @param aanbestedingIds - IDs van betrokken aanbestedingen
+ * @param reden - Reden voor de update
+ * @param nieuweDocNamenPerTender - Optionele map: tenderId → array van nieuwe documentnamen
+ */
+export function recordTenderUpdates(
+  aanbestedingIds: string[],
+  reden: 'nieuwe_documenten' | 'eerste_analyse',
+  nieuweDocNamenPerTender?: Map<string, string[]>,
+): void {
+  if (!aanbestedingIds.length) return
+  const db = getDb()
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO tender_updates
+      (id, aanbesteding_id, titel, opdrachtgever, bron_naam, bron_url, reden, is_gelezen, nieuwe_document_namen)
+    SELECT lower(hex(randomblob(16))), a.id, a.titel, a.opdrachtgever, a.bron_naam, a.bron_url, ?, 0, ?
+    FROM aanbestedingen a WHERE a.id = ?
+  `)
+  const insertMany = db.transaction((ids: string[]) => {
+    for (const id of ids) {
+      const namen = nieuweDocNamenPerTender?.get(id)
+      const namenJson = namen && namen.length > 0 ? JSON.stringify(namen) : null
+      insert.run(reden, namenJson, id)
+    }
+  })
+  insertMany(aanbestedingIds)
+
+  // Push notificatie naar alle renderer-windows
+  const count = (db.prepare('SELECT COUNT(*) as c FROM tender_updates WHERE is_gelezen = 0').get() as { c: number }).c
+  for (const wc of webContents.getAllWebContents()) {
+    try { wc.send(IPC.TENDER_UPDATES_NEW, { count }) } catch { /* ignore */ }
+  }
+  log.info(`tender_updates: ${aanbestedingIds.length} aanbesteding(en) geregistreerd als '${reden}'`)
+}
 
 interface RawTender {
   titel: string
@@ -39,6 +85,14 @@ export async function runScrapePipeline(
   const newTenderIds: string[] = []
   const triggeredBy = options?.triggeredBy ?? 'manual'
 
+  // Snapshot: bestaande tenders met 0 documenten vóór de scrape
+  // Na de scrape controleren we welke van deze tenders nu wel docs hebben
+  const tendersZonderDocsVoor = new Set<string>(
+    (db.prepare(
+      `SELECT id FROM aanbestedingen WHERE (document_urls IS NULL OR document_urls = '[]' OR document_urls = '') AND totaal_score IS NULL`
+    ).all() as { id: string }[]).map((r) => r.id)
+  )
+
   for (const source of sources) {
     const jobId = crypto.randomUUID().replace(/-/g, '')
     db.prepare(
@@ -64,6 +118,22 @@ export async function runScrapePipeline(
           tenders = await scrapeGenericViaBrowser(source, zoektermen, onProgress, jobId)
       }
 
+      const settingsRows = db.prepare('SELECT key, value FROM app_settings').all() as { key: string; value: string }[]
+      const headerGateSettings: Record<string, string> = {}
+      settingsRows.forEach((r) => {
+        headerGateSettings[r.key] = r.value
+      })
+      const rawBeforeHeaderGate = tenders.length
+      tenders = (await filterTendersExcludingPersonnelHeadersWithGpt4o(
+        tenders,
+        headerGateSettings
+      )) as RawTender[]
+      if (rawBeforeHeaderGate > tenders.length) {
+        log.info(
+          `${source.naam}: ${rawBeforeHeaderGate - tenders.length} overgeslagen (kopregel: geen personeel/vacature-inkoop, gpt-4o/regex)`
+        )
+      }
+
       log.info(`${source.naam}: found ${tenders.length} raw tenders`)
 
       // Store found tenders (deduplicate by URL)
@@ -77,6 +147,13 @@ export async function runScrapePipeline(
       const existingUrls = new Set(
         (db.prepare('SELECT bron_url FROM aanbestedingen WHERE bron_website_id = ?').all(source.id) as { bron_url: string }[])
           .map(r => r.bron_url)
+      )
+
+      // URLs die door de gebruiker zijn verwijderd — nooit opnieuw tonen
+      const deletedUrls = new Set(
+        (db.prepare(
+          'SELECT bron_url FROM verwijderde_bron_urls WHERE bron_website_id = ? OR bron_website_id IS NULL'
+        ).all(source.id) as { bron_url: string }[]).map(r => r.bron_url)
       )
 
       let newCount = 0
@@ -101,6 +178,7 @@ export async function runScrapePipeline(
           continue
         }
         if (existingUrls.has(tender.bron_url)) continue
+        if (deletedUrls.has(tender.bron_url)) continue
 
         const newId = crypto.randomUUID().replace(/-/g, '')
         insertTender.run(
@@ -319,8 +397,59 @@ export async function runScrapePipeline(
     }
   }
 
+  // ── Detectie: welke tenders kregen nieuwe documenten tijdens deze scrape? ──
+  // 1. Nieuwe tenders (newTenderIds) die nu documenten hebben
+  // 2. Bestaande tenders die vóór de scrape 0 docs hadden en nu docs hebben
+  try {
+    const { enqueuePostScrapeAnalysis } = await import('../ipc/analysis.ipc')
+    const idsToCheck = [...new Set([...newTenderIds, ...tendersZonderDocsVoor])]
+    if (idsToCheck.length > 0) {
+      const placeholders = idsToCheck.map(() => '?').join(',')
+      const nuMetDocsRows = db.prepare(
+        `SELECT id, document_urls FROM aanbestedingen WHERE id IN (${placeholders})
+         AND document_urls IS NOT NULL AND document_urls != '[]' AND document_urls != ''`
+      ).all(...idsToCheck) as { id: string; document_urls: string | null }[]
+      const nuMetDocs = nuMetDocsRows.map((r) => r.id)
+
+      // Helper: haal document-namen uit JSON-array
+      const extractDocNamen = (row: { id: string; document_urls: string | null }): string[] => {
+        try {
+          const arr = JSON.parse(row.document_urls || '[]') as { naam?: string }[]
+          return arr.map((d) => d.naam || '').filter(Boolean)
+        } catch { return [] }
+      }
+
+      if (nuMetDocs.length > 0) {
+        // Nieuwe tenders met docs: 'eerste_analyse'; bestaande tenders met nieuwe docs: 'nieuwe_documenten'
+        const nieuweIds = nuMetDocs.filter((id) => newTenderIds.includes(id))
+        const bijgewerktIds = nuMetDocs.filter((id) => tendersZonderDocsVoor.has(id) && !newTenderIds.includes(id))
+
+        // Bouw document-namen maps
+        const nieuweDocMap = new Map<string, string[]>()
+        const bijgewerktDocMap = new Map<string, string[]>()
+        for (const row of nuMetDocsRows) {
+          const namen = extractDocNamen(row)
+          if (nieuweIds.includes(row.id)) nieuweDocMap.set(row.id, namen)
+          if (bijgewerktIds.includes(row.id)) bijgewerktDocMap.set(row.id, namen)
+        }
+
+        if (nieuweIds.length) recordTenderUpdates(nieuweIds, 'eerste_analyse', nieuweDocMap)
+        if (bijgewerktIds.length) recordTenderUpdates(bijgewerktIds, 'nieuwe_documenten', bijgewerktDocMap)
+
+        const analyseIds = await filterTenderIdsForAutoPostScrapeAnalysis(nuMetDocs)
+        if (analyseIds.length > 0) {
+          enqueuePostScrapeAnalysis(analyseIds)
+        }
+        log.info(`Scrape update-detectie: ${nieuweIds.length} nieuwe, ${bijgewerktIds.length} bijgewerkte tenders met docs`)
+      }
+    }
+  } catch (err: any) {
+    log.warn('Update-detectie of heranalyse mislukt:', err.message)
+  }
+
   return { totalFound, newTenderIds }
   } finally {
+    requestDebouncedCloudPush(8000)
     releaseBusyWorkBlocker('scrape-pipeline')
   }
 }
@@ -816,6 +945,13 @@ async function scrapeBelgiumPublicProcurementBrowser(
     source.url?.trim() ||
     'https://www.publicprocurement.be/supplier/enterprises/0/enterprises/overview'
 
+  const belgiumHeaderSettings = (() => {
+    const rows = getDb().prepare('SELECT key, value FROM app_settings').all() as { key: string; value: string }[]
+    const m: Record<string, string> = {}
+    for (const r of rows) m[r.key] = r.value
+    return m
+  })()
+
   const terms = zoektermen.length > 0 ? zoektermen.slice(0, BELGIUM_MAX_TERMS) : ['']
 
   for (let ti = 0; ti < terms.length; ti++) {
@@ -840,6 +976,7 @@ async function scrapeBelgiumPublicProcurementBrowser(
         backgroundThrottling: false,
       },
     })
+    keepWebContentsActiveForBackgroundWork(win)
 
     try {
       await win.loadURL(startUrl, {
@@ -889,6 +1026,14 @@ async function scrapeBelgiumPublicProcurementBrowser(
       for (const c of candidates) {
         if (detailCount >= BELGIUM_MAX_DETAILS_PER_TERM) break
         if (seenDetailUrls.has(c.url)) continue
+
+        if (await shouldSkipListItemForPersonnelHeaderGpt4o(c.titel, c.snippet, belgiumHeaderSettings)) {
+          log.info(
+            `België: detail niet geladen (personeel/vacature op kopregel, gpt-4o/regex): "${c.titel.slice(0, 80)}"`
+          )
+          seenDetailUrls.add(c.url)
+          continue
+        }
         seenDetailUrls.add(c.url)
 
         onProgress({
@@ -1855,6 +2000,7 @@ async function scrapeMercellViaBrowser(
       backgroundThrottling: false,
     },
   })
+  keepWebContentsActiveForBackgroundWork(win)
   win.webContents.setUserAgent(CHROME_LIKE_UA)
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
 
@@ -2158,6 +2304,7 @@ async function scrapeGenericViaBrowser(
       backgroundThrottling: false,
     },
   })
+  keepWebContentsActiveForBackgroundWork(win)
 
   try {
     await win.loadURL(source.url)

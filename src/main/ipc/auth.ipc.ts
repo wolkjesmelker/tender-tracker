@@ -3,6 +3,7 @@ import { getDb } from '../db/connection'
 import { IPC } from '../../shared/constants'
 import { getMainWindow } from '../index'
 import { getCookiesPath } from '../utils/paths'
+import { keepWebContentsActiveForBackgroundWork } from '../utils/keep-webcontents-active'
 import log from 'electron-log'
 import path from 'path'
 import fs from 'fs'
@@ -95,6 +96,44 @@ async function syncAuthenticatedFlagFromSession(siteId: string): Promise<boolean
   return ok
 }
 
+/** Cookie-backup terugzetten + in-memory ingelogd-vlag volgens echte auth-cookies (o.a. geplande tracking). */
+export async function refreshAuthFromSessionCookies(siteId: string): Promise<boolean> {
+  await injectCookiesFromFile(siteId)
+  return syncAuthenticatedFlagFromSession(siteId)
+}
+
+/**
+ * Wacht tot de site als ingelogd geldt (UI-event of geldige auth-cookies).
+ * Gebruikt door geplande tracking na openAuthLoginWindowForSite.
+ */
+export async function waitForSiteAuthenticated(
+  siteId: string,
+  maxWaitMs: number,
+  pollMs = 2500
+): Promise<boolean> {
+  const deadline = Date.now() + maxWaitMs
+  while (Date.now() < deadline) {
+    if (authenticatedSites.has(siteId)) return true
+    if (await sessionHasUsableAuth(siteId)) {
+      authenticatedSites.add(siteId)
+      const mw = getMainWindow()
+      const row = getDb().prepare('SELECT naam FROM bron_websites WHERE id = ?').get(siteId) as
+        | { naam: string }
+        | undefined
+      if (mw && !mw.isDestroyed() && row?.naam) {
+        mw.webContents.send(IPC.AUTH_LOGIN_COMPLETE, {
+          siteId,
+          success: true,
+          siteName: row.naam,
+        })
+      }
+      return true
+    }
+    await new Promise((r) => setTimeout(r, pollMs))
+  }
+  return authenticatedSites.has(siteId)
+}
+
 /** Bewaar alle cookies van een sessie naar disk-backup. */
 async function saveCookiesToFile(siteId: string, ses: Electron.Session): Promise<void> {
   try {
@@ -171,6 +210,253 @@ export async function persistAllAuthCookiesToDisk(): Promise<void> {
   }
 }
 
+/**
+ * Na het openen van een inlogvenster weer het hoofdvenster voorop (esthetiek: login blijft open maar TenderTracker blijft zichtbaar).
+ */
+function focusMainWindowAfterAuthWindow(): void {
+  const mw = getMainWindow()
+  if (!mw || mw.isDestroyed()) return
+  if (mw.isMinimized()) mw.restore()
+  mw.show()
+  try {
+    mw.moveTop()
+  } catch {
+    /* noop */
+  }
+  try {
+    app.focus()
+  } catch {
+    /* noop */
+  }
+  mw.focus()
+}
+
+/**
+ * Zelfde logica als de knop «Inloggen» op de Tracking-pagina — te gebruiken vanuit de main-process
+ * (o.a. geplande tracking).
+ */
+export async function openAuthLoginWindowForSite(
+  siteId: string
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    const source = getDb().prepare('SELECT * FROM bron_websites WHERE id = ?').get(siteId) as any
+    if (!source) {
+      return { success: false, error: 'Bron niet gevonden' }
+    }
+
+    if (authWindows.has(siteId)) {
+      try {
+        authWindows.get(siteId)?.close()
+      } catch {
+        /* noop */
+      }
+      authWindows.delete(siteId)
+    }
+
+    const partition = `persist:auth-${siteId}`
+    const ses = session.fromPartition(partition)
+
+    ses.setUserAgent(CHROME_LIKE_UA)
+    await injectCookiesFromFile(siteId)
+
+    const authWindow = new BrowserWindow({
+      width: 1280,
+      height: 900,
+      title: `Inloggen — ${source.naam}`,
+      show: true,
+      webPreferences: {
+        partition,
+        nodeIntegration: false,
+        contextIsolation: true,
+        backgroundThrottling: false,
+      },
+    })
+
+    authWindows.set(siteId, authWindow)
+    keepWebContentsActiveForBackgroundWork(authWindow)
+
+    void attachCdpSpoof(authWindow.webContents)
+
+    authWindow.webContents.setUserAgent(CHROME_LIKE_UA)
+
+    authWindow.webContents.setWindowOpenHandler((details) => {
+      log.info(`Auth popup (${siteId}): ${details.url.slice(0, 160)}`)
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          width: 1024,
+          height: 768,
+          webPreferences: {
+            partition,
+            nodeIntegration: false,
+            contextIsolation: true,
+            backgroundThrottling: false,
+          },
+        },
+      }
+    })
+
+    authWindow.webContents.on('did-create-window', (childWindow) => {
+      keepWebContentsActiveForBackgroundWork(childWindow)
+      childWindow.webContents.setUserAgent(CHROME_LIKE_UA)
+      void attachCdpSpoof(childWindow.webContents)
+      setTimeout(() => focusMainWindowAfterAuthWindow(), 120)
+    })
+
+    const isSuccessUrl = (url: string): boolean => {
+      if (siteId === 'mercell') {
+        return (
+          url.includes('s2c.mercell.com') &&
+          !/login|signin|Account|identity\.|password\/|registration/i.test(url)
+        )
+      }
+      try {
+        const siteHost = new URL(source.url || source.login_url).hostname
+        return url.includes(siteHost) && !/login|signin|account|auth|oauth|identity/i.test(url)
+      } catch {
+        return false
+      }
+    }
+
+    const notifyLoggedIn = (url: string) => {
+      if (authenticatedSites.has(siteId)) return
+      authenticatedSites.add(siteId)
+      const mw = getMainWindow()
+      if (mw && !mw.isDestroyed()) {
+        mw.webContents.send(IPC.AUTH_LOGIN_COMPLETE, {
+          siteId,
+          success: true,
+          siteName: source.naam,
+        })
+      }
+      log.info(`Auth: succesvol ingelogd bij ${source.naam} (${url.slice(0, 100)})`)
+    }
+
+    authWindow.webContents.on('did-navigate', async (_, url) => {
+      log.info(`Auth nav (${siteId}): ${url}`)
+      await saveCookiesToFile(siteId, ses)
+      if (isSuccessUrl(url)) notifyLoggedIn(url)
+    })
+
+    authWindow.webContents.on('did-navigate-in-page', async (_, url) => {
+      await saveCookiesToFile(siteId, ses)
+      if (isSuccessUrl(url)) {
+        log.info(`Auth SPA-nav (${siteId}): ${url}`)
+        notifyLoggedIn(url)
+      }
+    })
+
+    authWindow.webContents.on('did-fail-load', (_e, code, desc, failedUrl) => {
+      if (!failedUrl || failedUrl === 'about:blank' || failedUrl.startsWith('about:')) return
+      log.warn(`Auth laad-fout (${siteId}): ${code} ${desc} — ${failedUrl}`)
+    })
+
+    // Auto-fill inloggegevens als deze zijn opgeslagen
+    if (source.login_gebruikersnaam && source.login_wachtwoord) {
+      const gebruikersnaam = source.login_gebruikersnaam as string
+      const wachtwoord = source.login_wachtwoord as string
+
+      const tryAutoFill = async (url: string) => {
+        // Alleen invullen op login-achtige pagina's
+        const looksLikeLoginPage =
+          /login|signin|aanmelden|inloggen|auth|identity|account\/login|password/i.test(url)
+        if (!looksLikeLoginPage) return
+
+        // Korte pauze zodat het formulier in de DOM staat
+        await new Promise(r => setTimeout(r, 1200))
+
+        try {
+          const filled = await authWindow.webContents.executeJavaScript(`
+            (function() {
+              // Zoek gebruikersnaam-veld: type email of text, of name/id/autocomplete bevat user/email/login
+              const usernameSelectors = [
+                'input[type="email"]',
+                'input[autocomplete="username"]',
+                'input[autocomplete="email"]',
+                'input[name*="user" i]',
+                'input[name*="email" i]',
+                'input[name*="login" i]',
+                'input[id*="user" i]',
+                'input[id*="email" i]',
+                'input[id*="login" i]',
+                'input[type="text"]',
+              ];
+              const passwordSelectors = [
+                'input[type="password"]',
+                'input[autocomplete="current-password"]',
+              ];
+
+              let usernameInput = null;
+              for (const sel of usernameSelectors) {
+                const el = document.querySelector(sel);
+                if (el && el.offsetParent !== null) { usernameInput = el; break; }
+              }
+              let passwordInput = null;
+              for (const sel of passwordSelectors) {
+                const el = document.querySelector(sel);
+                if (el && el.offsetParent !== null) { passwordInput = el; break; }
+              }
+
+              if (!usernameInput && !passwordInput) return 'geen-formulier';
+
+              function fillInput(el, value) {
+                el.focus();
+                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                nativeInputValueSetter.call(el, value);
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+              }
+
+              if (usernameInput) fillInput(usernameInput, ${JSON.stringify(gebruikersnaam)});
+              if (passwordInput) fillInput(passwordInput, ${JSON.stringify(wachtwoord)});
+
+              return 'ingevuld';
+            })()
+          `)
+          if (filled === 'ingevuld') {
+            log.info(`Auth auto-fill: inloggegevens ingevuld voor ${source.naam}`)
+          } else {
+            log.info(`Auth auto-fill: geen loginformulier gevonden op ${url.slice(0, 80)}`)
+          }
+        } catch (e) {
+          log.warn(`Auth auto-fill mislukt voor ${source.naam}:`, (e as Error).message)
+        }
+      }
+
+      authWindow.webContents.on('did-navigate', (_, url) => {
+        void tryAutoFill(url)
+      })
+      authWindow.webContents.on('did-frame-finish-load', () => {
+        const url = authWindow.webContents.getURL()
+        void tryAutoFill(url)
+      })
+    }    authWindow.on('closed', () => {
+      authWindows.delete(siteId)
+    })
+
+    const startUrl =
+      siteId === 'mercell'
+        ? 'https://s2c.mercell.com/today'
+        : source.url?.startsWith('http')
+          ? source.url
+          : source.login_url || source.url
+    try {
+      await authWindow.loadURL(startUrl, { userAgent: CHROME_LIKE_UA })
+    } catch (err) {
+      log.warn(`Auth loadURL mislukt voor ${source.naam}:`, err)
+    }
+
+    setImmediate(() => {
+      focusMainWindowAfterAuthWindow()
+    })
+
+    return { success: true }
+  } catch (err: any) {
+    log.error(`openAuthLoginWindowForSite mislukt voor ${siteId}:`, err?.message ?? err)
+    return { success: false, error: err?.message ?? 'Onbekende fout' }
+  }
+}
+
 export function registerAuthHandlers(): void {
   ipcMain.handle(IPC.AUTH_STATUS, async () => {
     const sources = getDb().prepare("SELECT * FROM bron_websites WHERE auth_type != 'none'").all() as any[]
@@ -208,146 +494,7 @@ export function registerAuthHandlers(): void {
    * - OAuth-popups krijgen dezelfde partition én CDP-spoof
    */
   ipcMain.handle(IPC.AUTH_OPEN_LOGIN, async (_event, siteId: string) => {
-    try {
-      const source = getDb().prepare('SELECT * FROM bron_websites WHERE id = ?').get(siteId) as any
-      if (!source) {
-        return { success: false, error: 'Bron niet gevonden' }
-      }
-
-      // Sluit bestaand venster
-      if (authWindows.has(siteId)) {
-        try { authWindows.get(siteId)?.close() } catch { /* noop */ }
-        authWindows.delete(siteId)
-      }
-
-      const partition = `persist:auth-${siteId}`
-      const ses = session.fromPartition(partition)
-
-      ses.setUserAgent(CHROME_LIKE_UA)
-      await injectCookiesFromFile(siteId)
-
-      const authWindow = new BrowserWindow({
-        width: 1280,
-        height: 900,
-        title: `Inloggen — ${source.naam}`,
-        show: true,
-        webPreferences: {
-          partition,
-          nodeIntegration: false,
-          contextIsolation: true,
-          backgroundThrottling: false,
-        },
-      })
-
-      authWindows.set(siteId, authWindow)
-
-      // CDP fire-and-forget — NIET blockerend, anders crash als venster snel navigeert
-      void attachCdpSpoof(authWindow.webContents)
-
-      authWindow.webContents.setUserAgent(CHROME_LIKE_UA)
-
-      // OAuth-popups (bijv. Microsoft login)
-      authWindow.webContents.setWindowOpenHandler((details) => {
-        log.info(`Auth popup (${siteId}): ${details.url.slice(0, 160)}`)
-        return {
-          action: 'allow',
-          overrideBrowserWindowOptions: {
-            width: 1024,
-            height: 768,
-            webPreferences: {
-              partition,
-              nodeIntegration: false,
-              contextIsolation: true,
-              backgroundThrottling: false,
-            },
-          },
-        }
-      })
-
-      authWindow.webContents.on('did-create-window', (childWindow) => {
-        childWindow.webContents.setUserAgent(CHROME_LIKE_UA)
-        void attachCdpSpoof(childWindow.webContents)
-      })
-
-      // ── Login-detectie helper ────────────────────────────────────────────────
-      // Geeft true als url wijst op een succesvol ingelogde sessiepagina.
-      const isSuccessUrl = (url: string): boolean => {
-        if (siteId === 'mercell') {
-          // Na OAuth-callback landen we op s2c.mercell.com/logon?code=...
-          // of na SPA-redirect op s2c.mercell.com/ of /search etc.
-          return (
-            url.includes('s2c.mercell.com') &&
-            !/login|signin|Account|identity\.|password\/|registration/i.test(url)
-          )
-        }
-        // Generiek: zelfde host als de geconfigureerde URL, geen login-patroon
-        try {
-          const siteHost = new URL(source.url || source.login_url).hostname
-          return url.includes(siteHost) && !/login|signin|account|auth|oauth|identity/i.test(url)
-        } catch {
-          return false
-        }
-      }
-
-      const notifyLoggedIn = (url: string) => {
-        if (authenticatedSites.has(siteId)) return // al gemeld
-        authenticatedSites.add(siteId)
-        // Haal mainWindow HIER op (niet buiten de callback) zodat we altijd de actuele ref hebben
-        const mw = getMainWindow()
-        if (mw && !mw.isDestroyed()) {
-          mw.webContents.send(IPC.AUTH_LOGIN_COMPLETE, {
-            siteId,
-            success: true,
-            siteName: source.naam,
-          })
-        }
-        log.info(`Auth: succesvol ingelogd bij ${source.naam} (${url.slice(0, 100)})`)
-      }
-      // ────────────────────────────────────────────────────────────────────────
-
-      // Volledige navigaties (OAuth-redirectketen, callback-URL)
-      authWindow.webContents.on('did-navigate', async (_, url) => {
-        log.info(`Auth nav (${siteId}): ${url}`)
-        await saveCookiesToFile(siteId, ses)
-        if (isSuccessUrl(url)) notifyLoggedIn(url)
-      })
-
-      // SPA-navigaties (pushState/replaceState) — Mercell navigeert na login via SPA
-      authWindow.webContents.on('did-navigate-in-page', async (_, url) => {
-        await saveCookiesToFile(siteId, ses)
-        if (isSuccessUrl(url)) {
-          log.info(`Auth SPA-nav (${siteId}): ${url}`)
-          notifyLoggedIn(url)
-        }
-      })
-
-      authWindow.webContents.on('did-fail-load', (_e, code, desc, failedUrl) => {
-        if (!failedUrl || failedUrl === 'about:blank' || failedUrl.startsWith('about:')) return
-        log.warn(`Auth laad-fout (${siteId}): ${code} ${desc} — ${failedUrl}`)
-      })
-
-      authWindow.on('closed', () => {
-        authWindows.delete(siteId)
-      })
-
-      // Start op vaste Mercell discovery-pagina; andere bronnen gebruiken hun geconfigureerde URL.
-      const startUrl =
-        siteId === 'mercell'
-          ? 'https://s2c.mercell.com/today'
-          : source.url?.startsWith('http')
-            ? source.url
-            : (source.login_url || source.url)
-      try {
-        await authWindow.loadURL(startUrl, { userAgent: CHROME_LIKE_UA })
-      } catch (err) {
-        log.warn(`Auth loadURL mislukt voor ${source.naam}:`, err)
-      }
-
-      return { success: true }
-    } catch (err: any) {
-      log.error(`AUTH_OPEN_LOGIN mislukt voor ${siteId}:`, err?.message ?? err)
-      return { success: false, error: err?.message ?? 'Onbekende fout' }
-    }
+    return openAuthLoginWindowForSite(siteId)
   })
 
   /**

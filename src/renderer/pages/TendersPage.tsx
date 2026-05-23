@@ -1,16 +1,45 @@
 import { useState, useEffect, useMemo } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { useTenders, useSources } from '../hooks/use-ipc'
-import { api } from '../lib/ipc-client'
-import { formatDate, getStatusLabel, getStatusColor, daysUntil } from '../lib/utils'
+import { useTenders, useSources, useSchedules } from '../hooks/use-ipc'
+import { api, isElectron } from '../lib/ipc-client'
+import { formatDate, formatDateTime, getStatusLabel, getStatusColor, daysUntil } from '../lib/utils'
 import {
   Search, Download, Brain, Loader2, CheckCircle2, XCircle,
   CalendarDays, FileText, CheckSquare, Square, RotateCcw, Trash2, Layers, ShieldAlert,
-  FileCheck, MessageSquare, Send, Eye, UserCheck, Archive, PenSquare, Hash,
+  FileCheck, MessageSquare, Send, Eye, UserCheck, Archive, PenSquare, Hash, Sparkles,
+  MapPinOff,
+  MapPin,
 } from 'lucide-react'
 import { DeleteConfirmationModal } from '../components/delete-confirmation-modal'
 import { useAnalysisActiveStore } from '../stores/analysis-active-store'
 import { useThemeStore } from '../stores/theme-store'
+import {
+  hasSchemaScrapeOnLocalDay,
+  latestLaatsteRunIsoOnLocalDay,
+  localDayKey,
+  tenderIsSchemaNieuwDayAfter,
+} from '../../shared/schema-scrape-nieuw'
+import type { BedrijfsProfiel } from '../../shared/types'
+import {
+  MAP_SELECTED_PROFILE_STORAGE_KEY,
+  readMapRadiusKmFromStorage,
+  tenderWorkAreaStatus,
+} from '../../shared/tender-work-area'
+
+async function geocodeBedrijfsprofiel(profiel: BedrijfsProfiel): Promise<[number, number] | null> {
+  try {
+    const result = await (api as any).geocodeAddress?.(
+      profiel.adres,
+      profiel.postcode,
+      profiel.stad,
+      profiel.land,
+    ) as { lat: number; lng: number } | null | undefined
+    if (result?.lat != null && result?.lng != null) return [result.lat, result.lng]
+  } catch {
+    /* IPC-fout negeren */
+  }
+  return null
+}
 
 type TenderSortOrder = 'created_desc' | 'deadline_asc' | 'score_desc'
 
@@ -72,6 +101,13 @@ export function TendersPage() {
   const [verlopenFilter, setVerlopenFilter] = useState<string>('active')
   const [sortOrder, setSortOrder] = useState<TenderSortOrder>('created_desc')
   const [dashboardLabel, setDashboardLabel] = useState('')
+  const [werkgebiedFilter, setWerkgebiedFilter] = useState<'all' | 'inside'>('all')
+  const [workAreaPrefsTick, setWorkAreaPrefsTick] = useState(0)
+  const [profielenWa, setProfielenWa] = useState<BedrijfsProfiel[]>([])
+  const [selectedProfielWaId, setSelectedProfielWaId] = useState<string | null>(null)
+  const [kantoorCoordsWa, setKantoorCoordsWa] = useState<[number, number] | null>(null)
+  const [geocodingKantoorWa, setGeocodingKantoorWa] = useState(false)
+  const [werkgebiedGeoBusy, setWerkgebiedGeoBusy] = useState(false)
 
   const resetFilters = () => {
     setSearch('')
@@ -82,6 +118,7 @@ export function TendersPage() {
     setSortOrder('created_desc')
     setDashboardLabel('')
     setDashboardKpiFilter(null)
+    setWerkgebiedFilter('all')
   }
 
   // Apply dashboard KPI filter when URL contains ?filter=…
@@ -113,6 +150,55 @@ export function TendersPage() {
     setSearchParams({}, { replace: true })
   }, [filterFromUrl])
 
+  useEffect(() => {
+    void (async () => {
+      try {
+        const rows = (await (api as any).getBedrijfsprofielen?.()) as BedrijfsProfiel[] | undefined
+        if (rows?.length) {
+          setProfielenWa(rows)
+          const savedId = localStorage.getItem(MAP_SELECTED_PROFILE_STORAGE_KEY)?.trim()
+          const pick =
+            (savedId && rows.some((p) => p.id === savedId) ? rows.find((p) => p.id === savedId) : null) ??
+            rows.find((p) => p.is_standaard) ??
+            rows[0]
+          setSelectedProfielWaId(pick.id)
+        }
+      } catch {
+        /* geen profielen */
+      }
+    })()
+  }, [])
+
+  useEffect(() => {
+    if (!selectedProfielWaId || !profielenWa.length) return
+    const profiel = profielenWa.find((p) => p.id === selectedProfielWaId)
+    if (!profiel) return
+    let cancelled = false
+    setGeocodingKantoorWa(true)
+    void geocodeBedrijfsprofiel(profiel).then((coords) => {
+      if (!cancelled) {
+        setKantoorCoordsWa(coords)
+        setGeocodingKantoorWa(false)
+      }
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [selectedProfielWaId, profielenWa])
+
+  useEffect(() => {
+    const bump = () => setWorkAreaPrefsTick((x) => x + 1)
+    window.addEventListener('focus', bump)
+    const onVis = () => {
+      if (document.visibilityState === 'visible') bump()
+    }
+    document.addEventListener('visibilitychange', onVis)
+    return () => {
+      window.removeEventListener('focus', bump)
+      document.removeEventListener('visibilitychange', onVis)
+    }
+  }, [])
+
   const { data: tenders, loading, refresh } = useTenders({
     search: search || undefined,
     status: statusFilter || undefined,
@@ -122,9 +208,34 @@ export function TendersPage() {
     ...(dashboardKpiFilter === 'today' ? { createdToday: true } : {}),
     ...(dashboardKpiFilter === 'urgent' ? { urgentOnly: true } : {}),
   })
+
+  useEffect(() => {
+    setWorkAreaPrefsTick((x) => x + 1)
+  }, [tenders])
+
+  useEffect(() => {
+    void workAreaPrefsTick
+    const saved = localStorage.getItem(MAP_SELECTED_PROFILE_STORAGE_KEY)?.trim()
+    if (!saved || !profielenWa.length) return
+    if (!profielenWa.some((p) => p.id === saved)) return
+    setSelectedProfielWaId((prev) => (prev === saved ? prev : saved))
+  }, [workAreaPrefsTick, profielenWa])
+
   const { data: sources } = useSources()
+  const { data: schedules } = useSchedules()
+  const scheduleNieuwRows = schedules ?? []
 
   const navigate = useNavigate()
+
+  const showScrapeNieuwBanner = useMemo(
+    () => hasSchemaScrapeOnLocalDay(scheduleNieuwRows),
+    [scheduleNieuwRows],
+  )
+  const latestRunIsoForBanner = useMemo(() => {
+    const day = localDayKey(new Date())
+    if (!day) return null
+    return latestLaatsteRunIsoOnLocalDay(scheduleNieuwRows, day)
+  }, [scheduleNieuwRows])
 
   const hasActiveFilters =
     search ||
@@ -134,7 +245,8 @@ export function TendersPage() {
     verlopenFilter !== 'active' ||
     sortOrder !== 'created_desc' ||
     dashboardLabel ||
-    dashboardKpiFilter
+    dashboardKpiFilter ||
+    werkgebiedFilter !== 'all'
 
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [pendingDelete, setPendingDelete] = useState<
@@ -148,27 +260,91 @@ export function TendersPage() {
 
   const allTenders = useMemo(() => {
     const list = [...((tenders as any[]) || [])]
-    if (sortOrder === 'created_desc') {
-      list.sort((a: any, b: any) => {
+    const isSchemaNieuw = (t: any) => tenderIsSchemaNieuwDayAfter(t, scheduleNieuwRows)
+    const tiebreak = (a: any, b: any) => {
+      if (sortOrder === 'created_desc') {
         const ta = new Date(a.created_at || 0).getTime()
         const tb = new Date(b.created_at || 0).getTime()
         if (tb !== ta) return tb - ta
         return (b.totaal_score ?? -1) - (a.totaal_score ?? -1)
-      })
-    } else if (sortOrder === 'deadline_asc') {
-      list.sort((a: any, b: any) => {
+      }
+      if (sortOrder === 'deadline_asc') {
         const pa = sluitingsdatumTime(a.sluitingsdatum)
         const pb = sluitingsdatumTime(b.sluitingsdatum)
         if (pa === null && pb === null) return 0
         if (pa === null) return 1
         if (pb === null) return -1
         return pa - pb
-      })
-    } else if (sortOrder === 'score_desc') {
-      list.sort((a: any, b: any) => (b.totaal_score ?? -1) - (a.totaal_score ?? -1))
+      }
+      return (b.totaal_score ?? -1) - (a.totaal_score ?? -1)
     }
+    list.sort((a: any, b: any) => {
+      const na = isSchemaNieuw(a)
+      const nb = isSchemaNieuw(b)
+      if (na !== nb) return na ? -1 : 1
+      return tiebreak(a, b)
+    })
     return list
-  }, [tenders, sortOrder])
+  }, [tenders, sortOrder, scheduleNieuwRows])
+
+  const mapRadiusKm = useMemo(() => {
+    void workAreaPrefsTick
+    return readMapRadiusKmFromStorage()
+  }, [workAreaPrefsTick])
+
+  const workAreaCompareReady =
+    mapRadiusKm > 0 && kantoorCoordsWa != null && !geocodingKantoorWa
+
+  const werkgebiedFilterEffective: 'all' | 'inside' =
+    werkgebiedFilter === 'inside' && workAreaCompareReady ? 'inside' : 'all'
+
+  const displayTenders = useMemo(() => {
+    if (werkgebiedFilterEffective !== 'inside') return allTenders
+    return allTenders.filter(
+      (t: any) => tenderWorkAreaStatus(t, kantoorCoordsWa, mapRadiusKm) !== 'outside',
+    )
+  }, [allTenders, werkgebiedFilterEffective, kantoorCoordsWa, mapRadiusKm])
+
+  useEffect(() => {
+    if (werkgebiedFilter === 'inside' && !workAreaCompareReady) {
+      setWerkgebiedFilter('all')
+    }
+  }, [werkgebiedFilter, workAreaCompareReady])
+
+  /** tenders zonder map-coördinaten: zelfde IPC als kaartpagina, zodat buiten/in werkgebied bepaald kan worden */
+  const werkgebiedMissingGeoKey = useMemo(() => {
+    if (!workAreaCompareReady) return ''
+    return (allTenders as any[])
+      .filter((t) => t.map_lat == null || t.map_lng == null)
+      .map((t) => String(t.id))
+      .sort()
+      .join('|')
+  }, [workAreaCompareReady, allTenders])
+
+  useEffect(() => {
+    if (!isElectron || !werkgebiedMissingGeoKey) return
+    const resolveFn = (api as { resolveTenderMapGeocodes?: (ids: string[]) => Promise<unknown> })
+      .resolveTenderMapGeocodes
+    if (typeof resolveFn !== 'function') return
+    const ids = werkgebiedMissingGeoKey.split('|').filter(Boolean)
+    if (ids.length === 0) return
+
+    let cancelled = false
+    const timer = window.setTimeout(() => {
+      setWerkgebiedGeoBusy(true)
+      void resolveFn(ids)
+        .then(() => {
+          if (!cancelled) return refresh()
+        })
+        .finally(() => {
+          if (!cancelled) setWerkgebiedGeoBusy(false)
+        })
+    }, 450)
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [werkgebiedMissingGeoKey, refresh])
 
   // Actieve analyse-statussen per tender uit de globale store
   const activeAnalyses = useAnalysisActiveStore((s) => s.active)
@@ -229,15 +405,34 @@ export function TendersPage() {
   }
 
   const toggleSelectAll = () => {
-    if (selected.size === allTenders.length) {
+    if (selected.size === displayTenders.length && displayTenders.length > 0) {
       setSelected(new Set())
     } else {
-      setSelected(new Set(allTenders.map((t: any) => t.id)))
+      setSelected(new Set(displayTenders.map((t: any) => t.id)))
     }
   }
 
   const handleBatchAnalyze = async () => {
     if (selected.size === 0) return
+    const selectedRows = allTenders.filter((t: any) => selected.has(t.id))
+    const alreadyAnalysed = selectedRows.filter((t: any) => t.totaal_score != null)
+    if (alreadyAnalysed.length > 0) {
+      const listed = alreadyAnalysed
+        .slice(0, 12)
+        .map((t: any, idx: number) => `${idx + 1}. ${t.titel || t.opdrachtgever || t.id}`)
+        .join('\n')
+      const extra =
+        alreadyAnalysed.length > 12
+          ? `\n… en nog ${alreadyAnalysed.length - 12} meer`
+          : ''
+      const proceed = window.confirm(
+        `Waarschuwing: ${alreadyAnalysed.length} geselecteerde aanbesteding(en) zijn al volledig geanalyseerd.\n` +
+          'Opnieuw analyseren verbruikt extra tokens.\n\n' +
+          `${listed}${extra}\n\n` +
+          'Toch doorgaan?',
+      )
+      if (!proceed) return
+    }
     setBatchRunning(true)
     setBatchProgress({ current: 0, total: selected.size, step: 'Batch-analyse starten...' })
 
@@ -282,8 +477,8 @@ export function TendersPage() {
   }
 
   const handleExport = async (format: 'pdf' | 'word') => {
-    if (!tenders || allTenders.length === 0) return
-    const ids = selected.size > 0 ? [...selected] : allTenders.map((t: any) => t.id)
+    if (!tenders || displayTenders.length === 0) return
+    const ids = selected.size > 0 ? [...selected] : displayTenders.map((t: any) => t.id)
     await api.exportData({ format, aanbestedingIds: ids, includeAnalysis: true, includeScores: true })
   }
 
@@ -403,6 +598,21 @@ export function TendersPage() {
           <option value="all">Alles tonen</option>
         </select>
         <select
+          value={werkgebiedFilter}
+          onChange={(e) => setWerkgebiedFilter(e.target.value as 'all' | 'inside')}
+          title={
+            workAreaCompareReady
+              ? `Zelfde straal (${mapRadiusKm} km) en kantoor als op de kaartpagina`
+              : 'Stel op de kaart een rijafstand (km) in; het kantoor komt uit het gekozen bedrijfsprofiel op de kaart.'
+          }
+          className="rounded-lg border bg-[var(--card)] px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[var(--ring)] max-w-[220px]"
+        >
+          <option value="all">Alle afstanden</option>
+          <option value="inside" disabled={!workAreaCompareReady}>
+            Toon binnen werkgebied
+          </option>
+        </select>
+        <select
           value={sortOrder}
           onChange={(e) => setSortOrder(e.target.value as TenderSortOrder)}
           className="rounded-lg border bg-[var(--card)] px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[var(--ring)]"
@@ -464,12 +674,12 @@ export function TendersPage() {
             onClick={toggleSelectAll}
             className="flex items-center gap-1.5 text-sm text-[var(--muted-foreground)] hover:text-[var(--foreground)] transition-colors"
           >
-            {selected.size === allTenders.length && allTenders.length > 0 ? (
+            {selected.size === displayTenders.length && displayTenders.length > 0 ? (
               <CheckSquare className="h-4 w-4 text-[var(--primary)]" />
             ) : (
               <Square className="h-4 w-4" />
             )}
-            {selected.size > 0 ? `${selected.size} geselecteerd` : `${allTenders.length} aanbestedingen`}
+            {selected.size > 0 ? `${selected.size} geselecteerd` : `${displayTenders.length} aanbestedingen`}
           </button>
 
           {selected.size > 0 && (
@@ -522,11 +732,43 @@ export function TendersPage() {
         </p>
       </div>
 
+      {/* Geplande scrape (schema): één dag banner "Nieuw", dag erna predicaat op tenders */}
+      {showScrapeNieuwBanner && (
+        <div className="flex items-center gap-3 rounded-xl border border-[var(--primary)]/30 bg-[var(--primary)]/10 px-4 py-3 shadow-sm">
+          <Sparkles className="h-5 w-5 shrink-0 text-[var(--primary)]" aria-hidden />
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-semibold text-[var(--foreground)]">Geplande scrape volgens schema</p>
+            <p className="text-xs text-[var(--muted-foreground)]">
+              {latestRunIsoForBanner
+                ? `Laatst afgerond ${formatDateTime(latestRunIsoForBanner)}`
+                : 'Vandaag uitgevoerd'}
+            </p>
+          </div>
+          <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-[var(--primary)] px-2.5 py-1 text-[10px] font-bold uppercase tracking-wide text-[var(--primary-foreground)]">
+            <Sparkles className="h-3 w-3" aria-hidden />
+            Nieuw
+          </span>
+        </div>
+      )}
+
+      {workAreaCompareReady && werkgebiedGeoBusy && (
+        <div className="flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--muted)]/40 px-3 py-2 text-xs text-[var(--muted-foreground)]">
+          <Loader2 className="h-4 w-4 shrink-0 animate-spin text-[var(--primary)]" aria-hidden />
+          <span>
+            Kaartlocaties ophalen om werkgebied te tonen (straal {mapRadiusKm} km)…
+          </span>
+        </div>
+      )}
+
       {/* Tender list */}
       <div className="space-y-2">
-        {allTenders.map((tender: any) => {
+        {displayTenders.map((tender: any) => {
           const days = daysUntil(tender.sluitingsdatum)
+          const showTenderSchemaNieuw = tenderIsSchemaNieuwDayAfter(tender, scheduleNieuwRows)
           const isSelected = selected.has(tender.id)
+          const werkgebiedStatus = workAreaCompareReady
+            ? tenderWorkAreaStatus(tender, kantoorCoordsWa, mapRadiusKm)
+            : ('inactive' as const)
           const activeEntry = activeAnalyses[tender.id]
           const isAnalysing = !!activeEntry
           const isRisico = activeEntry?.type === 'risico'
@@ -615,6 +857,24 @@ export function TendersPage() {
                           </span>
                         </div>
                       )}
+                      {workAreaCompareReady && werkgebiedStatus === 'outside' && (
+                        <div
+                          className="flex items-center gap-1 rounded-md border border-amber-300 bg-amber-50 px-2 py-1 text-[10px] font-semibold leading-tight text-amber-900 dark:border-amber-700 dark:bg-amber-950/50 dark:text-amber-200"
+                          title={`Buiten werkgebied: meer dan ${mapRadiusKm} km (luchtlijn) van het kantooradres op de kaart`}
+                        >
+                          <MapPinOff className="h-3 w-3 shrink-0 flex-shrink-0" aria-hidden />
+                          Buiten werkgebied
+                        </div>
+                      )}
+                      {workAreaCompareReady && werkgebiedStatus === 'no_coords' && !werkgebiedGeoBusy && (
+                        <div
+                          className="flex items-start gap-1 text-[10px] text-[var(--muted-foreground)]"
+                          title="Geen bruikbaar adres voor de kaart — werkgebied niet te vergelijken. Open de kaart of voer een analyse uit voor rijkere locatiegegevens."
+                        >
+                          <MapPin className="mt-0.5 h-3 w-3 shrink-0 opacity-70" aria-hidden />
+                          <span>Geen kaartlocatie</span>
+                        </div>
+                      )}
                       {tender.relevantie_score != null && tender.relevantie_score > 0 && (
                         <span
                           title={`Relevantiescore: ${Math.round(tender.relevantie_score)}/100`}
@@ -640,27 +900,32 @@ export function TendersPage() {
                     </div>
                   </div>
 
-                  {/* Status + delete */}
-                  <div className="flex items-center gap-1.5 pl-6 pt-1">
-                    <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${getStatusColor(tender.status)}`}>
-                      {getStatusLabel(tender.status)}
-                    </span>
+                  {/* Status + delete; bron op eigen regel (volle breedte kolom) zodat lange namen niet worden afgekapt */}
+                  <div className="space-y-1 pl-6 pt-1 min-w-0 pr-1">
+                    <div className="flex items-center gap-1.5">
+                      <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium ${getStatusColor(tender.status)}`}>
+                        {getStatusLabel(tender.status)}
+                      </span>
+                      <button
+                        type="button"
+                        title="Verwijderen"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          setPendingDelete({ kind: 'single', id: tender.id, titel: tender.titel || 'Zonder titel' })
+                        }}
+                        className="ml-auto shrink-0 rounded-md p-1 text-[var(--muted-foreground)] hover:text-red-600 hover:bg-red-50 transition-colors"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
                     {tender.bron_website_naam && (
-                      <span className="rounded bg-[var(--muted)] px-1.5 py-0.5 text-[9px] text-[var(--muted-foreground)] truncate max-w-[60px]" title={tender.bron_website_naam}>
+                      <span
+                        className="inline-block max-w-full rounded bg-[var(--muted)] px-1.5 py-0.5 text-[9px] leading-snug text-[var(--muted-foreground)] break-words"
+                        title={tender.bron_website_naam}
+                      >
                         {tender.bron_website_naam}
                       </span>
                     )}
-                    <button
-                      type="button"
-                      title="Verwijderen"
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        setPendingDelete({ kind: 'single', id: tender.id, titel: tender.titel || 'Zonder titel' })
-                      }}
-                      className="ml-auto rounded-md p-1 text-[var(--muted-foreground)] hover:text-red-600 hover:bg-red-50 transition-colors"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
                   </div>
                 </div>
 
@@ -671,9 +936,29 @@ export function TendersPage() {
                     onClick={() => navigate(`/aanbestedingen/${tender.id}`)}
                     className="w-full text-left"
                   >
-                    <h3 className="text-sm font-semibold text-[var(--foreground)] line-clamp-2 leading-snug hover:text-[var(--primary)] transition-colors">
-                      {tender.titel}
-                    </h3>
+                    <div className="flex flex-wrap items-start gap-2">
+                      <h3 className="min-w-0 flex-1 text-sm font-semibold text-[var(--foreground)] line-clamp-2 leading-snug hover:text-[var(--primary)] transition-colors">
+                        {tender.titel}
+                      </h3>
+                      {showTenderSchemaNieuw && (
+                        <span
+                          className="inline-flex shrink-0 items-center gap-0.5 rounded-full border border-[var(--primary)]/40 bg-[var(--primary)]/15 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-[var(--primary)]"
+                          title="Gevonden bij de laatste geplande scrape (gisteren)"
+                        >
+                          <Sparkles className="h-3 w-3" aria-hidden />
+                          Nieuw
+                        </span>
+                      )}
+                      {werkgebiedStatus === 'outside' && (
+                        <span
+                          className="inline-flex shrink-0 items-center gap-0.5 rounded-full border border-amber-300 bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-900 dark:border-amber-700 dark:bg-amber-950/50 dark:text-amber-200"
+                          title={`Buiten werkgebied: meer dan ${mapRadiusKm} km (luchtlijn) van het kantooradres op de kaart`}
+                        >
+                          <MapPinOff className="h-3 w-3 shrink-0" aria-hidden />
+                          Buiten werkgebied
+                        </span>
+                      )}
+                    </div>
                   </button>
 
                   {/* Pipeline — elke stap klikbaar naar eigen tab */}
@@ -822,7 +1107,7 @@ export function TendersPage() {
           )
         })}
 
-        {!loading && allTenders.length === 0 && (
+        {!loading && displayTenders.length === 0 && (
           <div className="rounded-xl border bg-[var(--card)] py-16 text-center">
             <FileText className="mx-auto h-12 w-12 text-[var(--muted-foreground)]/30" />
             <p className="mt-3 text-sm text-[var(--muted-foreground)]">

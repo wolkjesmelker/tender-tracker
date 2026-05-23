@@ -1,7 +1,7 @@
 import { NavLink } from 'react-router-dom'
 import {
   LayoutDashboard, FileSearch, Globe, Settings, ListChecks,
-  Brain, ScanSearch, ChevronLeft, ChevronRight, Layers, CalendarRange,
+  Brain, ScanSearch, ChevronLeft, ChevronRight, Layers, CalendarRange, Map,
 } from 'lucide-react'
 import { cn } from '../../lib/utils'
 import vdkLogo from '../../assets/vdk-logo.svg'
@@ -10,6 +10,7 @@ const navItems = [
   { to: '/', label: 'Dashboard', icon: LayoutDashboard },
   { to: '/aanbestedingen', label: 'Aanbestedingen', icon: FileSearch },
   { to: '/aanbestedingskalender', label: 'Aanbestedingskalender', icon: CalendarRange },
+  { to: '/kaart', label: 'Kaart', icon: Map },
   { to: '/pipeline', label: 'Pipeline', icon: Layers },
   { to: '/tracking', label: 'Tracking', icon: ScanSearch },
   { to: '/bronnen', label: 'Bronnen', icon: Globe },

@@ -257,6 +257,14 @@ async function startServer() {
     },
 
     'tenders:normalize-on-open': () => ({ success: true, updated: false }),
+    'tenders:add-manual-documents': () => ({
+      success: false,
+      error: 'Handmatig documenten toevoegen is alleen beschikbaar in de desktop-app.',
+    }),
+    'tenders:remove-catalog-entries': () => ({
+      success: false,
+      error: 'Documenten verwijderen uit de catalogus is alleen beschikbaar in de desktop-app.',
+    }),
     'tenders:discover-documents': () => ({ success: false, error: 'Niet beschikbaar in browser-modus' }),
 
     'tenders:local-doc-read': ([payload]) => {
@@ -627,11 +635,30 @@ async function startServer() {
 
     // ---- Export ----
     'export:generate': () => ({ success: false, error: 'Export niet beschikbaar in browser-modus' }),
+    'export:tender-summary': () => ({ success: false, error: 'Samenvatting exporteren vereist de desktop-app' }),
 
     // ---- Cloud back-up (desktop only) ----
     'backup:select-cloud-folder': () => ({ ok: false, error: 'Alleen beschikbaar in de desktop-app', path: null }),
     'backup:get-manifest': () => ({ ok: true, manifest: null }),
     'backup:run-mirror-sync': () => ({ ok: false, error: 'Alleen beschikbaar in de desktop-app' }),
+
+    // ---- Agent (browser: beperkt; desktop doet echte opslag) ----
+    'agent:web-search': () => ({ ok: true, results: [] }),
+    'agent:send-message': () => ({ ok: false, error: 'Agent alleen in desktop-app' }),
+    'agent:get-history': () => [],
+    'agent:clear-history': () => ({ ok: true }),
+    'agent:pin-search-result': () => ({
+      ok: false,
+      error: 'Internetresultaten vastzetten vereist de desktop-app (bestandsopslag + database).',
+    }),
+    'agent:delete-pinned-note': () => ({ ok: false, error: 'Alleen in desktop-app' }),
+    'agent:start-fill': () => ({ ok: false, error: 'Niet in browser' }),
+    'agent:get-fill-state': () => null,
+    'agent:get-fill-summary': () => [],
+    'agent:save-fill-field': () => ({ ok: false, error: 'Niet in browser' }),
+    'agent:learn-correction': () => ({ ok: false, error: 'Niet in browser' }),
+    'agent:export-fill': () => ({ ok: false, error: 'Niet in browser' }),
+    'agent:export-filled-document': () => ({ ok: false, error: 'Niet in browser' }),
 
     // ---- App shell ----
     'app:version': () => require('../package.json').version + '-web',
@@ -640,6 +667,11 @@ async function startServer() {
     'app:check-updates': () => null,
     'app:download-update': () => null,
     'app:install-update': () => null,
+
+    'release:list': () => ({ ok: false, message: 'Alleen beschikbaar in de desktop-app.', rows: [] }),
+    'release:create-draft': () => ({ ok: false, message: 'Alleen beschikbaar in de desktop-app.' }),
+    'release:delete-draft': () => ({ ok: false, message: 'Alleen beschikbaar in de desktop-app.' }),
+    'release:promote-live': () => ({ ok: false, message: 'Alleen beschikbaar in de desktop-app.' }),
   }
 
   // -------------------------------------------------------------------------

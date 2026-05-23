@@ -5,12 +5,14 @@ import { fetchRisicoWetgevingsContext } from './risico-wetgevings-context'
 import { parseAnalysisJsonResponse } from './parse-ai-json'
 import {
   listAllFillStatesForTender,
+  listAllChecklistItemsForTender,
   getFillSummaryForTender,
   saveFillValue,
   checkContradictionForField,
   persistContradiction,
 } from './document-fill-engine'
-import { searchWeb, pinSearchResultToTender, listPinnedNotes } from './web-search'
+import { searchWeb, addManualWebSearchToTender, listPinnedNotes } from './web-search'
+import { enqueueIncrementalManualDocumentAnalysis } from '../ipc/analysis.ipc'
 import { recordCorrection, inferDocumentTypeHint } from './agent-learning'
 import type {
   Aanbesteding,
@@ -22,6 +24,7 @@ import type {
   ProcedureTimelineStep,
 } from '../../shared/types'
 import { readLocalDocumentAndExtractText } from '../scraping/document-fetcher'
+import { getTenderDateSnapshot, formatTenderDateSnapshotLine } from '../../shared/tender-date-snapshot'
 
 // ---------------------------------------------------------------------------
 // Systeemprompt: expert aanbestedingswetgeving, direct en zakelijk
@@ -30,6 +33,26 @@ import { readLocalDocumentAndExtractText } from '../scraping/document-fetcher'
 const AGENT_BASE_PROMPT = `Je bent een senior aanbestedingsspecialist (Nederlandse + EU-aanbestedingsrecht) en
 juridisch adviseur. Je kent Aanbestedingswet 2012, Gids Proportionaliteit, ARW 2016,
 UAV 2012/UAV-GC 2005, AVG en de relevante EU-richtlijnen (2014/24/EU, 2014/25/EU).
+
+REIKWIJDTE (verplicht)
+- Je antwoordt op vragen over de aanbestedingen die in deze applicatie in de lijst staan (zie blok PORTFOLIO_OVERZICHT).
+- Ook vragen waarin de gebruiker een andere tender uit die lijst noemt (titel, opdrachtgever, referentie) behoren tot jouw taken: gebruik het overzicht om de juiste aanbesteding te koppelen en wees expliciet welke tender je bedoelt (ID/titel).
+- Als er géén actieve tender-context is (alleen portfolio): geef algemene antwoorden op basis van het overzicht en vraag zo nodig om op de detailpagina van een specifieke aanbesteding verder te gaan voor documentinhoud.
+- Wanneer wél een actieve tender is meegegeven: die tender is de primaire focus, maar je mag die vergelijken met of afzetten tegen andere items uit het portfolio als de gebruiker dat vraagt.
+
+DATUMS (verplicht kennen en correct gebruiken)
+- Voor elke tender onderscheid je scherp:
+  • Start inschrijving — meestal publicatiedatum / start aanmeldperiode.
+  • Einde inschrijving — sluitingsdatum / uiterste datum indiening (ook wel “deadline”).
+  • Start en einde uitvoering / contractperiode — uit AI-geëxtraheerde velden of procedure/tijdlijn, indien aanwezig.
+- Gebruik de waarden uit de context (PORTFOLIO en/of DETAIL). Bij twijfel tussen bronnen: noem beide waarden en wat de voorkeursbron is (bijv. sluitingsdatum in DB vs. TNS-API).
+- Datums in antwoorden als DD-MM-JJJJ waar mogelijk; anders exact zoals in de data staat.
+
+GEDOWNLOADE DOCUMENTEN (verplicht)
+- De documentenlijst per tender toont welke bestanden lokaal op schijf staan (gemarkeerd als “lokaal” / localNaam).
+- Voor inhoud van zo’n bestand: gebruik read_document met de exacte bestandsnaam uit de lijst (naam of localNaam).
+- Zonder lokale kopie kun je geen volledige tekst uitlezen: zeg dan dat het bestand nog niet is gedownload en verwijs naar de bron-URL of documentenlijst.
+- search_documents helpt bij snelle treffers in beschrijving, ruwe tekst en samenvatting; voor diep antwoord op PDF/Word/ZIP-inhoud: read_document.
 
 STIJL
 - Nederlands.
@@ -44,19 +67,69 @@ Je kunt tools gebruiken door in je antwoord UITSLUITEND een JSON-blok als dit op
 Gebruik één tool-call per beurt. Na een tool-result krijg je de kans opnieuw te antwoorden.
 
 Beschikbare tools:
-- read_document(document_naam: string) — Lees volledige tekst van een lokaal document in deze tender.
+- read_document(document_naam: string) — Lees geëxtraheerde tekst van een lokaal gedownload document van de actieve tender (argument = naam zoals in de documentenlijst).
 - web_search(query: string, count?: number) — Zoek op het internet; resultaten worden je getoond, de gebruiker beslist of ze worden toegevoegd aan het dossier.
 - pin_search_result(url: string, summary: string, query?: string) — Voeg een gevonden internetresultaat toe aan het dossier (alleen na instemming gebruiker).
-- get_fill_state(document_naam?: string) — Haal huidige invulstatus op van één of alle documenten.
+- get_fill_state(document_naam?: string) — Haal huidige invulstatus op van één of alle documenten (actieve tender).
 - save_fill_value(document_naam, field_id, value) — Sla een veldwaarde op (alleen met instemming gebruiker).
 - flag_contradiction(document_naam, field_id, severity, message) — Markeer veld als tegenstrijdig.
-- search_documents(query: string) — Zoek binnen de bestaande documenten / ruwe tekst van deze aanbesteding.
+- search_documents(query: string) — Snel zoeken in beschrijving, ruwe tekst, samenvatting én documentnamen van de actieve tender.
+
+INVUL- EN CHECKLIST-DATA (verplichte werkwijze)
+- Het blok NOG TE VULLEN / VERZAMELEN PER DOCUMENT bevat alle openstaande
+  verplichte velden en onafgevinkte checklist-items per document. Gebruik
+  uitsluitend dit blok (plus read_document bij twijfel) om te zeggen wat
+  er nog ontbreekt.
+- Verzin GEEN extra verplichtingen, stukken of velden die niet in dit
+  blok (of in de bron zelf via read_document) staan. Als iets niet in de
+  data zit, zeg dat expliciet in plaats van het aan te vullen uit
+  algemene kennis.
 
 ANTWOORDDISCIPLINE
 - Zonder tool: geef een bondig zakelijk antwoord (max. ~6 regels tenzij gebruiker om detail vraagt).
 - Bij invullen: stel per veld één heldere vraag, of geef meerdere vragen per stap in een wizardstijl.
 - Markeer onzekerheden met [?].
 - Bedragen Nederlands genoteerd (€ 1.234.567,89). Datums als DD-MM-JJJJ.`
+
+const PORTFOLIO_MAX_ROWS = 120
+
+/** Compact overzicht van alle niet-gearchiveerde aanbestedingen (zelfde scope als de standaard lijst). */
+function buildPortfolioOverviewBlock(): string {
+  const db = getDb()
+  const rows = db
+    .prepare(
+      `SELECT id, titel, opdrachtgever, referentienummer, status, document_urls, ai_extracted_fields, tender_procedure_context,
+              publicatiedatum, sluitingsdatum
+       FROM aanbestedingen
+       WHERE status != 'gearchiveerd'
+       ORDER BY datetime(created_at) DESC
+       LIMIT ?`,
+    )
+    .all(PORTFOLIO_MAX_ROWS) as Aanbesteding[]
+
+  if (!rows.length) {
+    return 'PORTFOLIO_OVERZICHT:\n(geen actieve aanbestedingen in de lijst)'
+  }
+  const lines = rows.map((r) => {
+    let nLocal = 0
+    let nTot = 0
+    try {
+      if (r.document_urls) {
+        const arr = JSON.parse(r.document_urls) as StoredDocumentEntry[]
+        if (Array.isArray(arr)) {
+          nTot = arr.length
+          nLocal = arr.filter((d) => Boolean(d.localNaam?.trim())).length
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    const dateLine = formatTenderDateSnapshotLine(r)
+    const titelShort = r.titel.length > 72 ? `${r.titel.slice(0, 69)}…` : r.titel
+    return `- [${r.id}] ${titelShort} | OG: ${r.opdrachtgever || '-'} | ref: ${r.referentienummer || '-'} | ${dateLine} | documenten ${nLocal}/${nTot} lokaal`
+  })
+  return `PORTFOLIO_OVERZICHT (${rows.length} aanbesteding(en) in lijst; sluit gearchiveerde uit):\n${lines.join('\n')}`
+}
 
 function buildTenderContextBlock(
   tender: Aanbesteding,
@@ -90,17 +163,19 @@ function buildTenderContextBlock(
     /* ignore */
   }
 
+  const snap = getTenderDateSnapshot(tender)
   const blocks: string[] = []
   blocks.push(
-    `AANBESTEDING:
+    `ACTIEVE_AANBESTEDING (detail — combineer met PORTFOLIO_OVERZICHT voor vergelijkingen):
 - ID: ${tender.id}
 - Titel: ${tender.titel}
 - Opdrachtgever: ${extracted.opdrachtgever || tender.opdrachtgever || '-'}
 - Referentienummer: ${extracted.referentienummer || tender.referentienummer || '-'}
-- Publicatiedatum: ${extracted.publicatiedatum || tender.publicatiedatum || '-'}
-- Sluitingsdatum inschrijving: ${extracted.sluitingsdatum_inschrijving || tender.sluitingsdatum || '-'}
-- Start uitvoering: ${extracted.datum_start_uitvoering || '-'}
-- Einde uitvoering: ${extracted.datum_einde_uitvoering || '-'}
+DATUMS (start/einde inschrijving + uitvoering; opgebouwd uit publicatie/sluiting/API/AI-extractie):
+- Start inschrijving / publicatie: ${snap.startInschrijvingRaw || tender.publicatiedatum || extracted.publicatiedatum || '-'}
+- Einde inschrijving / sluiting: ${snap.endInschrijvingRaw || extracted.sluitingsdatum_inschrijving || tender.sluitingsdatum || '-'}
+- Start uitvoering: ${snap.startUitvoeringRaw || extracted.datum_start_uitvoering || '-'}
+- Einde uitvoering: ${snap.endUitvoeringRaw || extracted.datum_einde_uitvoering || '-'}
 - Procedure: ${extracted.procedure_type || '-'}
 - Type opdracht: ${extracted.type_opdracht || tender.type_opdracht || '-'}
 - Regio: ${extracted.locatie_of_regio || tender.regio || '-'}
@@ -116,10 +191,16 @@ function buildTenderContextBlock(
     blocks.push(`PROCEDURE-TIJDLIJN:\n${lines.join('\n')}`)
   }
   if (documents.length) {
+    const localCount = documents.filter((d) => Boolean(d.localNaam?.trim())).length
     const lines = documents
       .slice(0, 50)
-      .map((d) => `- ${d.naam}${d.localNaam ? ' (lokaal)' : ''}${d.type ? ` [${d.type}]` : ''}`)
-    blocks.push(`DOCUMENTEN (${documents.length}):\n${lines.join('\n')}`)
+      .map(
+        (d) =>
+          `- ${d.naam}${d.localNaam ? ' (lokaal — read_document mogelijk)' : ' (nog niet lokaal)'}${d.type ? ` [${d.type}]` : ''}`,
+      )
+    blocks.push(
+      `DOCUMENTEN (${localCount} lokaal gedownload van ${documents.length} in catalogus; read_document alleen bij «lokaal»):\n${lines.join('\n')}`,
+    )
   }
   if (risk) {
     const topRisks = (risk.top5_risicos || []).slice(0, 5).map((r, i) => `${i + 1}. ${r}`).join('\n')
@@ -135,17 +216,85 @@ function buildTenderContextBlock(
   }
   const fillSummary = getFillSummaryForTender(tender.id)
   if (fillSummary.length) {
-    const lines = fillSummary.map(
-      (s) =>
-        `- ${s.document_naam}: ${s.filled_fields}/${s.total_fields} ingevuld (${s.percentage}%)${
-          s.contradictions > 0 ? ` · ${s.contradictions} tegenstrijdigheid(en)` : ''
-        }`,
-    )
+    const lines = fillSummary.map((s) => {
+      const fields = s.total_fields > 0
+        ? `${s.required_filled}/${s.required_total || s.total_fields} verplicht ingevuld`
+        : 'geen herkende formuliervelden'
+      const checklist = s.checklist_total > 0
+        ? `; checklist ${s.checklist_done}/${s.checklist_total}`
+        : ''
+      const started = s.user_started ? '' : ' (nog niet gestart door gebruiker)'
+      const pct = s.user_started && s.total_fields > 0 ? ` — ${s.percentage}%` : ''
+      const contra = s.contradictions > 0 ? ` · ${s.contradictions} tegenstrijdigheid(en)` : ''
+      return `- ${s.document_naam}: ${fields}${checklist}${pct}${started}${contra}`
+    })
     blocks.push(`INVULSTATUS:\n${lines.join('\n')}`)
+  }
+
+  // Per document: concrete openstaande verplichte velden (labels) + nog te
+  // verzamelen checklist-items, zodat de agent direct kan antwoorden op
+  // vragen als "wat ontbreekt er nog voor document X?".
+  const allFillStates = listAllFillStatesForTender(tender.id)
+  const allChecklist = listAllChecklistItemsForTender(tender.id)
+  if (allFillStates.length || allChecklist.length) {
+    const docs = new Map<
+      string,
+      { openRequired: string[]; pendingChecklist: string[] }
+    >()
+    const ensure = (doc: string) => {
+      let e = docs.get(doc)
+      if (!e) {
+        e = { openRequired: [], pendingChecklist: [] }
+        docs.set(doc, e)
+      }
+      return e
+    }
+    for (const st of allFillStates) {
+      if (!st.field_required) continue
+      const hasValue = !!(st.value_text && st.value_text.trim())
+      const isConfirmed = st.status === 'filled' || st.status === 'approved' || st.user_touched === true
+      if (hasValue && isConfirmed) continue
+      ensure(st.document_naam).openRequired.push(st.field_label || st.field_id)
+    }
+    for (const it of allChecklist) {
+      if (it.done) continue
+      ensure(it.document_naam).pendingChecklist.push(it.label)
+    }
+    const sections: string[] = []
+    // Stabiele, leesbare volgorde: alfabetisch per document.
+    const docNames = Array.from(docs.keys()).sort((a, b) => a.localeCompare(b, 'nl'))
+    for (const doc of docNames) {
+      const entry = docs.get(doc)!
+      const parts: string[] = []
+      if (entry.openRequired.length) {
+        parts.push(
+          `  Openstaande verplichte velden: ${entry.openRequired.slice(0, 20).join(' · ')}${
+            entry.openRequired.length > 20 ? ` (+${entry.openRequired.length - 20} meer)` : ''
+          }`,
+        )
+      }
+      if (entry.pendingChecklist.length) {
+        parts.push(
+          `  Nog te verzamelen: ${entry.pendingChecklist.slice(0, 20).join(' · ')}${
+            entry.pendingChecklist.length > 20 ? ` (+${entry.pendingChecklist.length - 20} meer)` : ''
+          }`,
+        )
+      }
+      if (parts.length) sections.push(`- ${doc}\n${parts.join('\n')}`)
+    }
+    if (sections.length) {
+      blocks.push(
+        `NOG TE VULLEN / VERZAMELEN PER DOCUMENT (door de inschrijver):\n${sections.join('\n')}`,
+      )
+    }
   }
   const pinned = listPinnedNotes(tender.id)
   if (pinned.length) {
-    const lines = pinned.slice(0, 8).map((p) => `- ${p.summary}${p.source_url ? ` (bron: ${p.source_url})` : ''}`)
+    const lines = pinned.slice(0, 8).map((p) => {
+      const k = p.entry_kind === 'doc_ref' ? 'document' : 'aantekening'
+      const manual = p.is_manual_search ? ' [handmatige opzoekactie]' : ''
+      return `- [${k}]${manual} ${p.summary}${p.source_url ? ` (bron: ${p.source_url})` : ''}`
+    })
     blocks.push(`EERDER TOEGEVOEGDE INTERNET-NOTITIES:\n${lines.join('\n')}`)
   }
 
@@ -267,11 +416,24 @@ async function runTool(
       case 'pin_search_result': {
         if (!ctx.tenderId) return 'Geen tender.'
         const url = typeof args.url === 'string' ? args.url : undefined
-        const summary = String(args.summary || '')
         const query = typeof args.query === 'string' ? args.query : undefined
-        if (!summary) return 'Geen samenvatting geleverd.'
-        pinSearchResultToTender({ tenderId: ctx.tenderId, url, summary, query })
-        return 'Pinned.'
+        const title = String(args.title || '').trim()
+        const snippet = String(args.snippet || '').trim()
+        const summary = String(args.summary || '')
+        const useTitle = title || (summary ? summary.split(/\s+—\s+/)[0]?.trim() : '') || summary.slice(0, 200)
+        const useSnippet = snippet || (summary.includes('—') ? summary.split(/\s+—\s+/).slice(1).join(' — ') : summary)
+        if (!useTitle && !useSnippet && !url) return 'Geen gegevens om vast te pinnen.'
+        const res = addManualWebSearchToTender({
+          tenderId: ctx.tenderId,
+          title: useTitle || url || 'Zoekresultaat',
+          url,
+          snippet: useSnippet,
+          searchQuery: query,
+          kind: 'auto',
+        })
+        if (!res.ok) return res.error
+        enqueueIncrementalManualDocumentAnalysis(ctx.tenderId, [res.textFileName])
+        return 'Toegevoegd als handmatige opzoekactie (inclusief tekstexport).'
       }
       case 'get_fill_state': {
         if (!ctx.tenderId) return 'Geen tender.'
@@ -326,6 +488,25 @@ async function runTool(
         const q = String(args.query || '').toLowerCase()
         if (!q) return '[]'
         const hits: Array<{ doc: string; snippet: string }> = []
+        let catalog: StoredDocumentEntry[] = []
+        try {
+          catalog = JSON.parse(ctx.tender.document_urls || '[]') as StoredDocumentEntry[]
+          if (!Array.isArray(catalog)) catalog = []
+        } catch {
+          catalog = []
+        }
+        for (const d of catalog) {
+          const naam = (d.naam || '').toLowerCase()
+          const loc = (d.localNaam || '').toLowerCase()
+          if (naam.includes(q) || loc.includes(q)) {
+            hits.push({
+              doc: `bestand:${d.naam}`,
+              snippet: d.localNaam
+                ? 'Naam match — lokaal; gebruik read_document voor inhoud.'
+                : 'Naam match — nog niet lokaal; inhoud niet via read_document.',
+            })
+          }
+        }
         const hay = [
           { doc: 'beschrijving', text: ctx.tender.beschrijving || '' },
           { doc: 'ruwe_tekst', text: ctx.tender.ruwe_tekst || '' },
@@ -338,7 +519,7 @@ async function runTool(
             hits.push({ doc: h.doc, snippet: h.text.slice(start, idx + 180) })
           }
         }
-        return JSON.stringify(hits.slice(0, 10))
+        return JSON.stringify(hits.slice(0, 14))
       }
       default:
         return `Onbekende tool: ${name}`
@@ -355,6 +536,7 @@ async function runTool(
 
 async function buildSystemPrompt(tenderId?: string): Promise<string> {
   const parts: string[] = [AGENT_BASE_PROMPT]
+  parts.push(buildPortfolioOverviewBlock())
   if (tenderId) {
     const tender = getDb().prepare('SELECT * FROM aanbestedingen WHERE id = ?').get(tenderId) as
       | Aanbesteding

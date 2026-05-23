@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite'
+import { defineConfig, loadEnv } from 'vite'
 import react from '@vitejs/plugin-react'
 import electron from 'vite-plugin-electron'
 import renderer from 'vite-plugin-electron-renderer'
@@ -8,7 +8,20 @@ const projectRoot = __dirname
 /** Alleen renderer in de browser (geen Electron-main/preload). Zet: VITE_WEB_ONLY=1 */
 const webOnly = process.env.VITE_WEB_ONLY === '1'
 
-export default defineConfig({
+export default defineConfig(({ mode }) => {
+  // .env, .env.local, .env.[mode] (beide bestandsnamen zijn geldig)
+  // Eerst bovenliggende map (Aanbestedingen/.env), daarna tender-tracker/ — laatste wint
+  const parentRoot = path.join(projectRoot, '..')
+  const env = {
+    ...loadEnv(mode, parentRoot, ['NEXT_PUBLIC_', 'LICENSE_', 'VITE_']),
+    ...loadEnv(mode, projectRoot, ['NEXT_PUBLIC_', 'LICENSE_', 'VITE_']),
+  }
+  const licenseUrl = env.LICENSE_SERVER_URL ?? process.env.LICENSE_SERVER_URL ?? ''
+  const licenseKey = env.LICENSE_PRODUCT_KEY ?? process.env.LICENSE_PRODUCT_KEY ?? ''
+  const supabaseUrl = env.NEXT_PUBLIC_SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL ?? ''
+  const supabaseKey = env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? ''
+
+  return {
   plugins: [
     react(),
     ...(webOnly
@@ -18,11 +31,13 @@ export default defineConfig({
             {
               entry: path.join(projectRoot, 'src/main/index.ts'),
               vite: {
-                build: {
+                  build: {
                   outDir: path.join(projectRoot, 'dist-electron/main'),
                   define: {
-                    __LICENSE_SERVER_URL__: JSON.stringify(process.env.LICENSE_SERVER_URL ?? ''),
-                    __LICENSE_PRODUCT_KEY__: JSON.stringify(process.env.LICENSE_PRODUCT_KEY ?? ''),
+                    __LICENSE_SERVER_URL__: JSON.stringify(licenseUrl),
+                    __LICENSE_PRODUCT_KEY__: JSON.stringify(licenseKey),
+                    __SUPABASE_URL__: JSON.stringify(supabaseUrl),
+                    __SUPABASE_ANON_KEY__: JSON.stringify(supabaseKey),
                   },
                   rollupOptions: {
                     external: [
@@ -67,5 +82,6 @@ export default defineConfig({
   build: {
     outDir: path.join(projectRoot, 'dist'),
     emptyOutDir: true
+  }
   }
 })

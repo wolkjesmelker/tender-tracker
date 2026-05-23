@@ -360,6 +360,79 @@ class OpenAIProvider implements AIProvider {
   }
 }
 
+/**
+ * Google Gemini — native generateContent API.
+ * @see https://ai.google.dev/api/generate-content
+ *
+ * Gemini 2.5 Flash heeft 1M input-context en 65k output-tokens.
+ * De system-instructie gaat in een apart `systemInstruction`-veld.
+ */
+class GeminiProvider implements AIProvider {
+  readonly name = 'Google Gemini'
+  private apiKey: string
+  private model: string
+
+  constructor(apiKey: string, model: string = 'gemini-2.5-flash') {
+    this.apiKey = apiKey
+    this.model = model
+  }
+
+  async chat(messages: ChatMessage[], options?: ChatOptions): Promise<string> {
+    const systemMsg = messages.find(m => m.role === 'system')?.content || ''
+    const conversationMsgs = messages.filter(m => m.role !== 'system')
+
+    // Gemini gebruikt 'model' i.p.v. 'assistant' als rolnaam
+    const contents = conversationMsgs.map(m => ({
+      role: m.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: m.content }],
+    }))
+
+    const body: Record<string, unknown> = {
+      contents,
+      generationConfig: {
+        maxOutputTokens: 65536,
+        ...(options?.preferJsonOutput ? { responseMimeType: 'application/json' } : {}),
+      },
+    }
+
+    if (systemMsg) {
+      body.systemInstruction = { parts: [{ text: systemMsg }] }
+    }
+
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent?key=${this.apiKey}`
+    let response: Response
+    try {
+      response = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+    } catch (e) {
+      throw formatFetchFailure(e, 'Google Gemini API niet bereikbaar', endpoint)
+    }
+
+    if (!response.ok) {
+      const error = await response.text()
+      throw new Error(`Google Gemini API error: ${response.status} - ${error}`)
+    }
+
+    const data = await response.json() as {
+      candidates?: { content?: { parts?: { text?: string }[] } }[]
+      usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number }
+    }
+
+    const inputTokens = data.usageMetadata?.promptTokenCount ?? 0
+    const outputTokens = data.usageMetadata?.candidatesTokenCount ?? 0
+    logTokenUsage('Google Gemini', this.model, inputTokens, outputTokens)
+
+    return data.candidates?.[0]?.content?.parts?.[0]?.text || ''
+  }
+
+  async isAvailable(): Promise<boolean> {
+    return !!this.apiKey
+  }
+}
+
 class OllamaProvider implements AIProvider {
   readonly name = 'Ollama'
   private endpoint: string
@@ -438,7 +511,9 @@ export class AIService {
               ? 'Kimi (Moonshot API)'
               : providerType === 'kimi_cli'
                 ? 'Kimi Code CLI'
-                : 'deze cloud-provider'
+                : providerType === 'gemini'
+                  ? 'Google Gemini'
+                  : 'deze cloud-provider'
       throw new Error(
         `Geen API-sleutel ingesteld voor ${label}. ` +
           `Ga naar Instellingen → AI Model configuratie om je API-sleutel in te voeren.`
@@ -464,6 +539,9 @@ export class AIService {
         this.provider = new KimiCliProvider(apiKey, model || 'kimi-k2.6', moonshotBase, binary, maxSteps)
         break
       }
+      case 'gemini':
+        this.provider = new GeminiProvider(apiKey, model || 'gemini-2.5-flash')
+        break
       case 'ollama':
         this.provider = new OllamaProvider(ollamaEndpoint, model || 'llama3.1')
         break
@@ -477,6 +555,7 @@ export class AIService {
       openai: 'gpt-4o',
       moonshot: 'kimi-k2.6',
       kimi_cli: 'kimi-k2.6',
+      gemini: 'gemini-2.5-flash',
       ollama: 'llama3.1',
     }
     const modelResolved = modelTrim || defaultModel[providerType] || ''

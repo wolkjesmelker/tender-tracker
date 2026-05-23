@@ -1,6 +1,7 @@
 import { app } from 'electron'
 import path from 'path'
 import fs from 'fs'
+import log from 'electron-log'
 
 /** Interne opslag: onder userData, niet bedoeld als gebruikersmap in Finder (geen export- of open-knop). */
 const INTERNAL_DOCUMENT_ROOT = 'internal-document-store'
@@ -9,6 +10,39 @@ const LEGACY_DOCUMENT_ROOT = 'documents'
 
 export function getAppDataPath(): string {
   return app.getPath('userData')
+}
+
+/**
+ * Maakt alle vaste opslagmappen onder userData aan (idempotent).
+ * Gebruikt bij eerste start / nieuwe machine; wordt niet gebruikt om data te wissen bij updates.
+ * Cloud-/externe back-upmap is gebruikerskeuze en valt hier buiten.
+ */
+export function ensureAppStorageDirectories(): void {
+  const root = getAppDataPath()
+  const relativeDirs = [
+    INTERNAL_DOCUMENT_ROOT,
+    LEGACY_DOCUMENT_ROOT,
+    'exports',
+    'bron-preview-cache',
+    'filled-documents',
+    'cache',
+    'agent-learning',
+    'local-backups',
+    path.join('local-backups', 'last-session'),
+  ]
+  for (const rel of relativeDirs) {
+    const dir = path.join(root, rel)
+    try {
+      fs.mkdirSync(dir, { recursive: true })
+    } catch (e) {
+      log.warn(`[paths] Opslagmap aanmaken mislukt: ${dir}`, e)
+    }
+  }
+  try {
+    getCookiesPath()
+  } catch (e) {
+    log.warn('[paths] cookies-map initialiseren mislukt', e)
+  }
 }
 
 export function getExportPath(): string {
@@ -34,6 +68,22 @@ export function assertSafeDocumentFileName(name: string): string | null {
   const t = String(name || '').trim()
   if (!t || t.includes('..') || t.includes('/') || t.includes('\\') || t.includes('\0')) return null
   return t
+}
+
+/** Unieke bestandsnaam binnen een map (voorkomt overschrijven). */
+export function uniqueFileNameInDir(dir: string, preferredName: string): string | null {
+  const safe = assertSafeDocumentFileName(preferredName)
+  if (!safe) return null
+  fs.mkdirSync(dir, { recursive: true })
+  let candidate = safe
+  let n = 0
+  const ext = path.extname(safe)
+  const stem = path.basename(safe, ext) || 'bestand'
+  while (fs.existsSync(path.join(dir, candidate))) {
+    n += 1
+    candidate = `${stem}_${n}${ext}`
+  }
+  return candidate
 }
 
 /** Volledig pad naar een lokaal opgeslagen bijlage, of null. */

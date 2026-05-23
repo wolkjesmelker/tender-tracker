@@ -1,5 +1,35 @@
 // Shared types between main and renderer processes
 
+/** Voortgang tijdens volledige Supabase-upload (IPC `sync:progress`). */
+export type SupabaseSyncProgressPayload = { percent: number; label: string }
+
+/** Notificatie: tender ontving nieuwe documenten (of analyseerbaar geworden) na een scrape. */
+export interface TenderUpdate {
+  id: string
+  aanbesteding_id: string
+  titel: string
+  opdrachtgever?: string | null
+  bron_naam?: string | null
+  bron_url?: string | null
+  reden: 'nieuwe_documenten' | 'eerste_analyse'
+  detected_at: string
+  is_gelezen: 0 | 1
+  /** JSON-array van document-namen die nieuw waren (alleen bij reden=nieuwe_documenten). */
+  nieuwe_document_namen?: string | null
+}
+
+/** Centrale app-updaterollout (Supabase `tender_tracker_app_releases`). */
+export type AppReleaseStatus = 'draft' | 'live' | 'archived'
+
+export interface AppReleaseRow {
+  id: string
+  version: string
+  description: string
+  status: AppReleaseStatus
+  created_at: string
+  launched_at: string | null
+}
+
 export interface BronWebsite {
   id: string
   naam: string
@@ -13,6 +43,9 @@ export interface BronWebsite {
   sync_interval_uren: number
   created_at: string
   updated_at: string
+  /** Inloggegevens — alleen lokaal opgeslagen, nooit gesynchroniseerd naar cloud. */
+  login_gebruikersnaam?: string
+  login_wachtwoord?: string
 }
 
 export interface Zoekterm {
@@ -42,6 +75,8 @@ export interface StoredDocumentEntry {
   type: string
   /** Optioneel: oorspronkelijke ZIP-bundel (alleen metadata) */
   bronZipLabel?: string
+  /** True wanneer de gebruiker het bestand handmatig aan de lijst heeft toegevoegd */
+  addedByUser?: boolean
 }
 
 /** Stap in de procedure-tijdlijn (TenderNed API + aanvullingen). */
@@ -103,6 +138,27 @@ export interface BedrijfsProfiel {
   updated_at: string
 }
 
+/** Eén-pagina samenvatting voor popup + Word/PDF-export (alle waarden vooraf geformatteerd waar nodig). */
+export interface TenderSummaryExportPayload {
+  titel: string
+  /** Kern: AI-samenvatting en/of omschrijving + optioneel CPV-regel */
+  inhoud?: string
+  locatie?: string
+  /** Aanbestedende dienst / opdrachtgever («voor wie») */
+  opdrachtgever?: string
+  startUitvoering?: string
+  eindeUitvoering?: string
+  uiterlijkIndienen?: string
+  budget?: string
+  typeOpdracht?: string
+  referentie?: string
+  procedure?: string
+  publicatie?: string
+  bron?: string
+  /** Waar / hoe indienen */
+  indiening?: string
+}
+
 /** Door AI ingevulde kerngegevens (na analyse); ook voor lege DB-velden aanvullen. */
 export interface AiExtractedTenderFields {
   publicatiedatum?: string
@@ -159,6 +215,8 @@ export interface Aanbesteding {
   geraamde_waarde?: string
   ruwe_tekst?: string
   document_urls?: string
+  /** JSON string array: stabiele sleutels (`u:`/`l:`/`b:`) voor aangevinkte documenten in de UI */
+  document_catalog_selected_keys?: string
   /** ISO timestamp: post-scrape documentdiscovery rond (null = nog hervatbaar) */
   document_fetch_completed_at?: string
   /** JSON: TenderProcedureContext — procedure, tijdslijn, portals */
@@ -175,11 +233,22 @@ export interface Aanbesteding {
   risico_analyse?: string
   /** ISO timestamp van de laatste risico-analyse */
   risico_analyse_at?: string
+  /** JSON: RisicoAnalyseV2Result — agentic 19-agents pipeline */
+  risico_analyse_v2?: string
   is_upload: boolean
   bestandsnaam?: string
   notities?: string
   created_at: string
   updated_at: string
+  /** Cache van laatst bekende kaartcoördinaten (geocoding-resultaat). */
+  map_lat?: number | null
+  map_lng?: number | null
+  /** Originele query-string die naar deze coords leidde (voor invalidatie/herzoek). */
+  map_geocode_query?: string | null
+  /** ISO timestamp van de laatste geocoding-poging. */
+  map_geocode_at?: string | null
+  /** ISO 3166 alpha-2 landcode (lowercase) van het geocoderesultaat (bv. 'nl', 'be'). */
+  map_country_code?: string | null
 }
 
 export interface Criterium {
@@ -430,6 +499,10 @@ export interface AgentFillState {
   confidence?: number
   contradiction_flag: boolean
   contradiction_detail?: string
+  /** Letterlijke substring uit het brondocument die bewijst dat dit veld gevraagd wordt. */
+  source_quote?: string
+  /** True zodra een gebruiker dit veld echt heeft ingevuld of opgeslagen (niet alleen AI-voorstel). */
+  user_touched?: boolean
   updated_at: string
 }
 
@@ -441,6 +514,30 @@ export interface AgentDocumentFillSummary {
   contradictions: number
   status: 'not_started' | 'partial' | 'complete' | 'contradiction'
   percentage: number
+  /** True als de gebruiker iets echt heeft ingevuld (niet alleen AI-voorstellen of alleen geopend). */
+  user_started: boolean
+  /** Aantal als verplicht gemarkeerde velden. */
+  required_total: number
+  /** Aantal verplichte velden met een echte waarde (status filled/approved of user_touched met value). */
+  required_filled: number
+  /** Checklist-items (te verzamelen informatie) — totaal en afgevinkt. */
+  checklist_total: number
+  checklist_done: number
+}
+
+/** Checklist-item: informatie/stukken die de inschrijver moet verzamelen voor één document. */
+export interface AgentDocumentChecklistItem {
+  tender_id: string
+  document_naam: string
+  item_id: string
+  label: string
+  hint?: string
+  /** Letterlijke substring uit de documenttekst die dit item onderbouwt. */
+  source_quote?: string
+  order: number
+  done: boolean
+  done_at?: string
+  updated_at: string
 }
 
 export interface AgentLearningEntry {

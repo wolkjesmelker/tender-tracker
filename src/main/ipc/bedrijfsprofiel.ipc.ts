@@ -1,6 +1,7 @@
 import { ipcMain } from 'electron'
 import { getDb } from '../db/connection'
 import { IPC } from '../../shared/constants'
+import { requestDebouncedCloudPush } from '../db/supabase-sync'
 import type { BedrijfsProfiel } from '../../shared/types'
 
 function rowToProfile(r: Record<string, unknown>): BedrijfsProfiel {
@@ -73,6 +74,7 @@ export function registerBedrijfsprofielHandlers(): void {
     const row = db
       .prepare(`SELECT * FROM bedrijfsprofielen WHERE rowid = last_insert_rowid()`)
       .get() as Record<string, unknown>
+    requestDebouncedCloudPush()
     return { ok: true, profile: rowToProfile(row) }
   })
 
@@ -116,11 +118,13 @@ export function registerBedrijfsprofielHandlers(): void {
     const row = db
       .prepare(`SELECT * FROM bedrijfsprofielen WHERE id = ?`)
       .get(id) as Record<string, unknown>
+    requestDebouncedCloudPush()
     return { ok: true, profile: rowToProfile(row) }
   })
 
   ipcMain.handle(IPC.BEDRIJFSPROFIELEN_DELETE, (_e, id: string) => {
     getDb().prepare(`DELETE FROM bedrijfsprofielen WHERE id = ?`).run(id)
+    requestDebouncedCloudPush()
     return { ok: true }
   })
 
@@ -130,6 +134,7 @@ export function registerBedrijfsprofielHandlers(): void {
     db.prepare(
       `UPDATE bedrijfsprofielen SET is_standaard = 1, updated_at = datetime('now') WHERE id = ?`,
     ).run(id)
+    requestDebouncedCloudPush()
     return { ok: true }
   })
 }

@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { IPC } from '../shared/constants'
-import type { LicenseStatus } from '../shared/types'
+import type { LicenseStatus, SupabaseSyncProgressPayload, TenderSummaryExportPayload } from '../shared/types'
 
 const electronAPI = {
   // Tenders
@@ -12,6 +12,20 @@ const electronAPI = {
   getTenderStats: () => ipcRenderer.invoke(IPC.TENDERS_STATS),
   discoverTenderDocuments: (id: string) => ipcRenderer.invoke(IPC.TENDERS_DISCOVER_DOCUMENTS, id),
   normalizeTenderOnOpen: (id: string) => ipcRenderer.invoke(IPC.TENDERS_NORMALIZE_ON_OPEN, id),
+  addManualTenderDocuments: (tenderId: string) =>
+    ipcRenderer.invoke(IPC.TENDERS_ADD_MANUAL_DOCUMENTS, tenderId) as Promise<{
+      success: boolean
+      error?: string
+      cancelled?: boolean
+      added?: string[]
+    }>,
+  removeTenderCatalogEntries: (tenderId: string, keys: string[]) =>
+    ipcRenderer.invoke(IPC.TENDERS_REMOVE_CATALOG_ENTRIES, tenderId, keys) as Promise<{
+      success: boolean
+      error?: string
+      removedDocs?: number
+      removedBron?: number
+    }>,
   readLocalTenderDocument: (tenderId: string, fileName: string) =>
     ipcRenderer.invoke(IPC.TENDERS_LOCAL_DOC_READ, { tenderId, fileName }),
   saveLocalTenderDocumentAs: (tenderId: string, fileName: string) =>
@@ -30,6 +44,34 @@ const electronAPI = {
     const handler = (_: unknown, data: unknown) => callback(data)
     ipcRenderer.on(IPC.DOCUMENTS_DISCOVER_PROGRESS, handler)
     return () => ipcRenderer.removeListener(IPC.DOCUMENTS_DISCOVER_PROGRESS, handler)
+  },
+  resolveTenderMapGeocodes: (ids: string[]) =>
+    ipcRenderer.invoke(IPC.TENDERS_RESOLVE_MAP_GEOCODES, ids) as Promise<{
+      resolved: Array<{
+        id: string
+        lat: number | null
+        lng: number | null
+        country_code: string | null
+        query: string | null
+      }>
+    }>,
+  geocodeAddress: (
+    adres: string | undefined,
+    postcode: string | undefined,
+    stad: string | undefined,
+    land: string | undefined,
+  ) =>
+    ipcRenderer.invoke(IPC.GEOCODE_ADDRESS, adres, postcode, stad, land) as Promise<{
+      lat: number
+      lng: number
+    } | null>,
+  onResolveTenderMapGeocodesProgress: (
+    callback: (data: { done: number; total: number; current?: string }) => void,
+  ) => {
+    const handler = (_: unknown, data: unknown) =>
+      callback(data as { done: number; total: number; current?: string })
+    ipcRenderer.on(IPC.TENDERS_RESOLVE_MAP_GEOCODES_PROGRESS, handler)
+    return () => ipcRenderer.removeListener(IPC.TENDERS_RESOLVE_MAP_GEOCODES_PROGRESS, handler)
   },
 
   // Sources
@@ -65,6 +107,12 @@ const electronAPI = {
   deleteAIPrompt: (id: string) => ipcRenderer.invoke(IPC.AI_PROMPTS_DELETE, id),
 
   // Scraping
+  processUrl: (url: string) => ipcRenderer.invoke(IPC.TENDERS_PROCESS_URL, url),
+  onProcessUrlProgress: (callback: (data: { step: string; percentage: number }) => void) => {
+    const handler = (_: unknown, data: unknown) => callback(data as { step: string; percentage: number })
+    ipcRenderer.on(IPC.TENDERS_PROCESS_URL_PROGRESS, handler)
+    return () => ipcRenderer.removeListener(IPC.TENDERS_PROCESS_URL_PROGRESS, handler)
+  },
   startScraping: (options: Record<string, unknown>) => ipcRenderer.invoke(IPC.SCRAPING_START, options),
   stopScraping: (jobId: string) => ipcRenderer.invoke(IPC.SCRAPING_STOP, jobId),
   getScrapeJobs: () => ipcRenderer.invoke(IPC.SCRAPING_JOBS),
@@ -110,12 +158,37 @@ const electronAPI = {
 
   // Risico Inventarisatie
   startRisicoAnalyse: (aanbestedingId: string) => ipcRenderer.invoke(IPC.RISICO_START, aanbestedingId),
+  startRisicoAnalyseWithModel: (aanbestedingId: string, openaiModel: string) =>
+    ipcRenderer.invoke(IPC.RISICO_START_WITH_MODEL, aanbestedingId, openaiModel),
+  startRisicoAnalyseV2: (aanbestedingId: string, modelOverride?: string) =>
+    ipcRenderer.invoke(IPC.RISICO_START_V2, aanbestedingId, modelOverride),
   requestRisicoUiReplay: () => ipcRenderer.invoke(IPC.RISICO_UI_REPLAY),
+  saveRisicoHtml: (html: string, filename: string) =>
+    ipcRenderer.invoke(IPC.RISICO_SAVE_HTML, { html, filename }) as Promise<{
+      success: boolean
+      filePath?: string
+      error?: string
+      cancelled?: boolean
+    }>,
+  saveRisicoPdf: (html: string, filename: string) =>
+    ipcRenderer.invoke(IPC.RISICO_SAVE_PDF, { html, filename }) as Promise<{
+      success: boolean
+      filePath?: string
+      error?: string
+      cancelled?: boolean
+    }>,
   onRisicoProgress: (callback: (data: unknown) => void) => {
     const handler = (_: unknown, data: unknown) => callback(data)
     ipcRenderer.on(IPC.RISICO_PROGRESS, handler)
     return () => ipcRenderer.removeListener(IPC.RISICO_PROGRESS, handler)
   },
+  onRisicoDraftSnapshot: (callback: (data: unknown) => void) => {
+    const handler = (_: unknown, data: unknown) => callback(data)
+    ipcRenderer.on(IPC.RISICO_DRAFT_SNAPSHOT, handler)
+    return () => ipcRenderer.removeListener(IPC.RISICO_DRAFT_SNAPSHOT, handler)
+  },
+  fetchRisicoDraftCheckpoint: (aanbestedingId: string) =>
+    ipcRenderer.invoke(IPC.RISICO_FETCH_CHECKPOINT_DRAFT, aanbestedingId),
 
   // Tender Agent
   agentSendMessage: (payload: { tenderId?: string; message: string }) =>
@@ -149,12 +222,31 @@ const electronAPI = {
   }) => ipcRenderer.invoke(IPC.AGENT_LEARN_CORRECTION, payload),
   agentWebSearch: (payload: { query: string; count?: number }) =>
     ipcRenderer.invoke(IPC.AGENT_WEB_SEARCH, payload),
-  agentPinSearchResult: (payload: { tenderId: string; url?: string; summary: string; query?: string }) =>
-    ipcRenderer.invoke(IPC.AGENT_PIN_SEARCH_RESULT, payload),
+  agentPinSearchResult: (payload: {
+    tenderId: string
+    url?: string
+    title?: string
+    snippet?: string
+    summary?: string
+    query?: string
+    kind?: 'auto' | 'doc_ref' | 'note'
+  }) => ipcRenderer.invoke(IPC.AGENT_PIN_SEARCH_RESULT, payload),
+  agentDeletePinnedNote: (pinId: string) => ipcRenderer.invoke(IPC.AGENT_DELETE_PINNED_NOTE, pinId),
   agentExportFill: (payload: { tenderId: string; documentNaam: string }) =>
     ipcRenderer.invoke(IPC.AGENT_EXPORT_FILL, payload),
-  agentExportFilledDocument: (payload: { tenderId: string; documentNaam: string }) =>
-    ipcRenderer.invoke(IPC.AGENT_EXPORT_FILLED_DOCUMENT, payload),
+  agentExportFilledDocument: (payload: {
+    tenderId: string
+    documentNaam: string
+    format?: 'pdf' | 'docx'
+  }) => ipcRenderer.invoke(IPC.AGENT_EXPORT_FILLED_DOCUMENT, payload),
+  agentGetDocChecklist: (payload: { tenderId: string; documentNaam: string }) =>
+    ipcRenderer.invoke(IPC.AGENT_GET_DOC_CHECKLIST, payload),
+  agentToggleDocChecklistItem: (payload: {
+    tenderId: string
+    documentNaam: string
+    itemId: string
+    done: boolean
+  }) => ipcRenderer.invoke(IPC.AGENT_TOGGLE_DOC_CHECKLIST_ITEM, payload),
   onAgentStreamChunk: (callback: (data: unknown) => void) => {
     const handler = (_: unknown, data: unknown) => callback(data)
     ipcRenderer.on(IPC.AGENT_STREAM_CHUNK, handler)
@@ -168,11 +260,30 @@ const electronAPI = {
 
   // Export
   exportData: (options: Record<string, unknown>) => ipcRenderer.invoke(IPC.EXPORT_GENERATE, options),
+  exportTenderSummary: (payload: { format: 'pdf' | 'word'; data: TenderSummaryExportPayload }) =>
+    ipcRenderer.invoke(IPC.EXPORT_TENDER_SUMMARY, payload) as Promise<{
+      success: boolean
+      filePath?: string
+      error?: string
+    }>,
 
   // Cloud back-up / synchronisatie
   selectCloudSyncFolder: () => ipcRenderer.invoke(IPC.BACKUP_SELECT_CLOUD_FOLDER),
   getCloudSyncManifest: (syncRoot?: string) => ipcRenderer.invoke(IPC.BACKUP_GET_MANIFEST, syncRoot),
   runCloudMirrorSync: (syncRoot: string) => ipcRenderer.invoke(IPC.BACKUP_RUN_MIRROR_SYNC, syncRoot),
+
+  // Supabase cloud sync
+  syncGetStatus: () => ipcRenderer.invoke(IPC.SYNC_STATUS),
+  syncNow: () => ipcRenderer.invoke(IPC.SYNC_NOW),
+  syncFullPush: () => ipcRenderer.invoke(IPC.SYNC_FULL_PUSH),
+  syncFullPull: () => ipcRenderer.invoke(IPC.SYNC_FULL_PULL),
+  syncTestConnection: () =>
+    ipcRenderer.invoke(IPC.SYNC_TEST_CONNECTION) as Promise<{ ok: boolean; error: string | null }>,
+  onSyncProgress: (callback: (data: SupabaseSyncProgressPayload) => void) => {
+    const handler = (_: unknown, data: unknown) => callback(data as SupabaseSyncProgressPayload)
+    ipcRenderer.on(IPC.SYNC_PROGRESS, handler)
+    return () => ipcRenderer.removeListener(IPC.SYNC_PROGRESS, handler)
+  },
 
   // Settings
   getSetting: (key: string) => ipcRenderer.invoke(IPC.SETTINGS_GET, key),
@@ -204,6 +315,12 @@ const electronAPI = {
   checkAppUpdates: () => ipcRenderer.invoke(IPC.APP_CHECK_UPDATES),
   downloadAppUpdate: () => ipcRenderer.invoke(IPC.APP_DOWNLOAD_UPDATE),
   installAppUpdate: () => ipcRenderer.invoke(IPC.APP_INSTALL_UPDATE),
+
+  releaseList: () => ipcRenderer.invoke(IPC.RELEASE_LIST),
+  releaseCreateDraft: (payload: { version: string; description: string }) =>
+    ipcRenderer.invoke(IPC.RELEASE_CREATE_DRAFT, payload),
+  releaseDeleteDraft: (id: string) => ipcRenderer.invoke(IPC.RELEASE_DELETE_DRAFT, id),
+  releasePromoteLive: (id: string) => ipcRenderer.invoke(IPC.RELEASE_PROMOTE_LIVE, id),
   quitApp: () => ipcRenderer.send('app:quit'),
   openExternal: (url: string) => ipcRenderer.invoke('app:open-external', url),
   onUpdateAvailable: (callback: (data: unknown) => void) => {
@@ -220,6 +337,20 @@ const electronAPI = {
     const handler = (_: unknown, data: unknown) => callback(data)
     ipcRenderer.on(IPC.APP_UPDATE_PROGRESS, handler)
     return () => ipcRenderer.removeListener(IPC.APP_UPDATE_PROGRESS, handler)
+  },
+
+  // Tender updates (notificaties na scrape)
+  getTenderUpdates: () => ipcRenderer.invoke(IPC.TENDER_UPDATES_LIST),
+  getTenderUpdatesCount: () => ipcRenderer.invoke(IPC.TENDER_UPDATES_COUNT) as Promise<number>,
+  markTenderUpdateRead: (id: string) => ipcRenderer.invoke(IPC.TENDER_UPDATES_MARK_READ, id),
+  markAllTenderUpdatesRead: () => ipcRenderer.invoke(IPC.TENDER_UPDATES_MARK_ALL_READ),
+  clearTenderUpdates: () => ipcRenderer.invoke(IPC.TENDER_UPDATES_CLEAR),
+  getTenderUpdatesForTender: (aanbestedingId: string) =>
+    ipcRenderer.invoke(IPC.TENDER_UPDATES_FOR_TENDER, aanbestedingId),
+  onTenderUpdatesNew: (callback: (data: { count: number }) => void) => {
+    const handler = (_: unknown, data: unknown) => callback(data as { count: number })
+    ipcRenderer.on(IPC.TENDER_UPDATES_NEW, handler)
+    return () => ipcRenderer.removeListener(IPC.TENDER_UPDATES_NEW, handler)
   },
 }
 
